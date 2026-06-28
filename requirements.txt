@@ -1,0 +1,17 @@
+# slack_to_zotero — runtime dependencies
+#
+# The pipeline uses stdlib (urllib, json, hashlib, sqlite3, etc.) for Slack
+# parsing and storage. Content fetches (publisher HTML for the LLM stage, PDF
+# downloads) go through http_fetch.py, which prefers curl_cffi for browser
+# TLS/HTTP2 impersonation — that's what gets past fingerprint-gated publisher
+# CDNs (ScienceDirect, Lancet, …) — and falls back to stdlib urllib when it
+# isn't installed.
+
+curl_cffi>=0.6     # browser-impersonating HTTP client (http_fetch.py); optional — urllib fallback if absent
+pyzotero>=1.5      # Zotero API client (zotero_client.py)
+anthropic>=0.25    # LLM metadata fallback
+streamlit>=1.49    # GUI — the primary lab-member interface (app.py)
+watchdog>=6.0
+libsql>=0.1        # hosted SQLite (Turso) client for cloud deploy; only used when
+                   # TURSO_DATABASE_URL/TURSO_AUTH_TOKEN are set (database._connect).
+                   # Local dev uses stdlib sqlite3 and never imports it.

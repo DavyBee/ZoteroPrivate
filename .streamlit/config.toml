@@ -1,0 +1,8 @@
+# Streamlit configuration for the Slack→Zotero app.
+#
+# runOnSave: when any source file (app.py OR a helper module) changes on disk,
+# Streamlit reruns automatically AND reloads the changed module. This avoids the
+# stale-module problem you hit with the manual "Rerun" button, where app.py
+# reloads but an edited helper (app_helpers, config, database, …) does not.
+[server]
+runOnSave = true
