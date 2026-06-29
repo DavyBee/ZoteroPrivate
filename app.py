@@ -50,6 +50,24 @@ def get_db():
     return st.session_state.db
 
 
+ADMIN_EMAIL = "david.beeson123@gmail.com"
+
+
+def _is_admin() -> bool:
+    """Debug mode has one-click destructive resets against the SHARED database, so
+    on the hosted deploy it's restricted to the owner. Streamlit fills st.user.email
+    from the Google sign-in on a private Community Cloud app (set by the platform,
+    not spoofable). Local dev has no auth → allow (dev convenience); on the cloud
+    with no verifiable email → deny."""
+    try:
+        email = getattr(st.user, "email", None)
+    except Exception:
+        email = None
+    if email:
+        return email.strip().lower() == ADMIN_EMAIL
+    return not os.environ.get("TURSO_DATABASE_URL")   # local → allow, hosted → deny
+
+
 def refresh_tables():
     """Give every dataframe a fresh widget key on the next render — WITHOUT
     re-reading the library from disk.
@@ -744,36 +762,40 @@ def tab_upload(db):
 
     _render_upload_errors(db)
 
-    st.divider()
+    # PDF-only papers (a saved PDF with no metadata, needing a manual Zotero drag-in)
+    # are rare now that pypdf + vision usually extract metadata — so only show this
+    # whole section when there actually are some.
     n_pdfonly = H.status_counts(db)["PDF only"]
-    st.markdown(f"**PDF-only papers ({n_pdfonly})** — saved files with no metadata. "
-                "Save them to a folder, drag that folder into Zotero desktop (its "
-                "recognizer fills in the metadata), then click Confirm so they count "
-                "as uploaded.")
-    n_pdf = len(H.pdf_only_papers(db))
-    c1, c2, c3 = st.columns(3)
-    if c1.button(f"💾 Save {n_pdf} PDFs to a folder…", disabled=not n_pdf):
-        dest = H.finder_pick_folder()
-        if dest:
-            n = H.export_pdfs(db, dest)
-            st.success(f"Saved {n} PDF(s) to {dest}")
-    if c2.button(f"📁 Open the default folder ({n_pdf})"):
-        # Rebuild the default queue from the DB first so it can't show stale files.
-        H.export_pdfs(db, H.upload_queue_dir(), wipe=True)
-        subprocess.run(["open", str(H.upload_queue_dir())])
-    if c3.button(f"✓ Confirm {n_pdfonly} added to Zotero", disabled=not n_pdfonly,
-                 help="Mark the PDF-only papers as done after you've dragged them "
-                      "into Zotero desktop, so the counts stay correct."):
-        _undoable(f"Confirmed {n_pdfonly} PDF paper(s) as uploaded")
-        n = db.confirm_pdf_uploads()
-        db.save()
-        cleared = H.clear_upload_queue()    # they've been dragged into Zotero — empty the staging folder
-        st.session_state.upload_flash = (
-            f"Confirmed {n} PDF paper(s) as uploaded"
-            + (f"; cleared {cleared} file(s) from the drag-in folder." if cleared
-               else "."))
-        refresh_tables()
-        st.rerun()
+    if n_pdfonly:
+        st.divider()
+        st.markdown(f"**PDF-only papers ({n_pdfonly})** — saved files with no metadata. "
+                    "Save them to a folder, drag that folder into Zotero desktop (its "
+                    "recognizer fills in the metadata), then click Confirm so they count "
+                    "as uploaded.")
+        n_pdf = len(H.pdf_only_papers(db))
+        c1, c2, c3 = st.columns(3)
+        if c1.button(f"💾 Save {n_pdf} PDFs to a folder…", disabled=not n_pdf):
+            dest = H.finder_pick_folder()
+            if dest:
+                n = H.export_pdfs(db, dest)
+                st.success(f"Saved {n} PDF(s) to {dest}")
+        if c2.button(f"📁 Open the default folder ({n_pdf})"):
+            # Rebuild the default queue from the DB first so it can't show stale files.
+            H.export_pdfs(db, H.upload_queue_dir(), wipe=True)
+            subprocess.run(["open", str(H.upload_queue_dir())])
+        if c3.button(f"✓ Confirm {n_pdfonly} added to Zotero",
+                     help="Mark the PDF-only papers as done after you've dragged them "
+                          "into Zotero desktop, so the counts stay correct."):
+            _undoable(f"Confirmed {n_pdfonly} PDF paper(s) as uploaded")
+            n = db.confirm_pdf_uploads()
+            db.save()
+            cleared = H.clear_upload_queue()    # they've been dragged into Zotero — empty the staging folder
+            st.session_state.upload_flash = (
+                f"Confirmed {n} PDF paper(s) as uploaded"
+                + (f"; cleared {cleared} file(s) from the drag-in folder." if cleared
+                   else "."))
+            refresh_tables()
+            st.rerun()
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -825,7 +847,7 @@ def main():
         tab_settings(db)
 
     st.divider()
-    if st.toggle("🛠 Debug mode", key="debug_mode"):
+    if _is_admin() and st.toggle("🛠 Debug mode", key="debug_mode"):
         render_debug(db)
 
     render_footer()
