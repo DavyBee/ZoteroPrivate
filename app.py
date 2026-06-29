@@ -26,7 +26,7 @@ import config
 import zotero_client
 from database import DatabaseError, normalize_url
 
-st.set_page_config(page_title="Slack → Zotero", page_icon="", layout="wide")
+st.set_page_config(page_title="Slack to Zotero", page_icon="", layout="wide")
 
 
 # ── Shared state ────────────────────────────────────────────────────────────
@@ -774,7 +774,7 @@ def main():
     config.load_dotenv(override=True)
     db = get_db()
     st.markdown(_TAB_CSS, unsafe_allow_html=True)
-    st.title("Slack → Zotero pipeline")
+    st.title("Slack to Zotero pipeline")
     render_env_banner()
     render_status_bar(db)
     render_undo_banner()
