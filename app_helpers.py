@@ -676,7 +676,11 @@ def enrich_init(db: Database) -> dict:
         "idx": 0,            # next paper to attempt
         "done": 0,           # papers actually enriched (for progress / counts)
         "counts": {"ok": 0, "llm": 0, "pdf": 0, "manual": 0,
-                   "link": 0, "non": 0, "fail": 0},
+                   "link": 0, "non": 0, "fail": 0,
+                   # pdf_total counts every paper that got a PDF on disk this run
+                   # (ready/llm with an attachment AND the PDF-only ones), so the
+                   # summary can report total PDFs saved, not just the PDF-only bucket.
+                   "pdf_total": 0},
     }
 
 
@@ -711,6 +715,8 @@ def enrich_step(db: Database, state: dict, anthropic_key: str | None,
     db.update_paper(normalize_url(url), **fields)
     category, label = _outcome(fields)
     state["counts"][category] += 1
+    if fields.get("local_pdf_path"):
+        state["counts"]["pdf_total"] += 1
     state["done"] += 1
     state["idx"] = i + 1       # advance only after a successful enrich
     if state["done"] % 10 == 0:

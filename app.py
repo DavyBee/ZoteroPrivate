@@ -388,9 +388,10 @@ def _finish_enrich(stopped=False):
         c = last["counts"]
         prefix = "Stopped — partial run: " if stopped else "Done: "
         st.session_state.enrich_result = (
-            prefix + f"{c['ok']} ready, {c['llm']} LLM, {c['pdf']} PDF saved, "
-            f"{c['manual']} access-issues, {c['link']} links, {c['non']} junk, "
-            f"{c['fail']} failed.")
+            prefix + f"{c['ok']} ready, {c['llm']} llm, {c['manual']} access issues, "
+            f"{c['link']} other links, {c['non']} junk, {c['fail']} failed "
+            f"({c['pdf']} PDF only saved). "
+            f"With these, we also saved {c['pdf_total']} total PDFs.")
     st.session_state.enriching = False
     st.session_state.enrich_paused = False
     for k in ("enrich_state", "enrich_lines", "enrich_last"):
