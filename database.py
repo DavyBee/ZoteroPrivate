@@ -23,6 +23,7 @@ changes when swapping the local file for hosted Turso (see WEBSITE_TODO.md).
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import sqlite3
@@ -226,6 +227,17 @@ _SCHEMA_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS settings (
         key   TEXT PRIMARY KEY,
         value TEXT
+    )
+    """,
+    # Durable named snapshots of the whole library (currently just "baseline", the
+    # post-enrich checkpoint behind "Undo Review changes"). One JSON blob per name,
+    # so it lives in Turso on the hosted deploy and survives restarts. See
+    # Database.save_named_snapshot / restore_named_snapshot. (The per-action one-
+    # step Undo is in-RAM — snapshot_state — and never touches this table.)
+    """
+    CREATE TABLE IF NOT EXISTS snapshots (
+        name TEXT PRIMARY KEY,
+        data TEXT
     )
     """,
 )
@@ -511,6 +523,70 @@ class Database:
                 raise
         finally:
             conn.close()
+
+    # ── Snapshots (undo / baseline) ──────────────────────────────────────────
+    # Both restore mechanisms route through the in-memory dicts + save(), so they
+    # behave identically on a local file and on Turso. (The previous design copied
+    # the local DB file with shutil.copy, which was a silent no-op on the hosted
+    # deploy where the data lives in Turso.)
+
+    def snapshot_state(self) -> tuple:
+        """Deep copy of the current in-memory state, for the per-action one-step
+        Undo. Cheap (RAM only, no DB write), so it's safe before every action."""
+        return (copy.deepcopy(self._papers), copy.deepcopy(self._processed))
+
+    def restore_state(self, snapshot: tuple) -> None:
+        """Replace the in-memory state with a snapshot_state() copy and persist.
+        The incremental save writes only the rows that actually differ."""
+        papers, processed = snapshot
+        self._papers = copy.deepcopy(papers)
+        self._processed = copy.deepcopy(processed)
+        self.save()
+
+    def save_named_snapshot(self, name: str) -> None:
+        """Persist the whole current state as a durable named snapshot — one JSON
+        row in `snapshots` (lives in Turso on the hosted deploy, so it survives
+        restarts). Used for the post-enrich baseline; infrequent, so the full-state
+        blob is fine. DELETE+INSERT (not UPSERT) to match the local/libsql paths."""
+        blob = json.dumps({"papers": self._papers, "processed": self._processed},
+                          ensure_ascii=False)
+        conn = _connect(self.db_path)
+        try:
+            _ensure_schema(conn)
+            conn.execute("DELETE FROM snapshots WHERE name = ?", (name,))
+            conn.execute("INSERT INTO snapshots (name, data) VALUES (?, ?)",
+                         (name, blob))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def has_named_snapshot(self, name: str) -> bool:
+        conn = _connect(self.db_path)
+        try:
+            _ensure_schema(conn)
+            row = conn.execute(
+                "SELECT 1 FROM snapshots WHERE name = ?", (name,)).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def restore_named_snapshot(self, name: str) -> bool:
+        """Replace the in-memory state with a durable named snapshot and persist.
+        Returns False if the snapshot doesn't exist."""
+        conn = _connect(self.db_path)
+        try:
+            _ensure_schema(conn)
+            row = conn.execute(
+                "SELECT data FROM snapshots WHERE name = ?", (name,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return False
+        data = json.loads(row[0])
+        self._papers = data.get("papers", {})
+        self._processed = data.get("processed", {})
+        self.save()
+        return True
 
     def export_sqlite_bytes(self) -> bytes:
         """Serialize the current in-memory state to a standalone SQLite file and

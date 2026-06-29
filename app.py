@@ -47,7 +47,7 @@ def get_db():
                     "SQLite tool to repair it, or move the file aside to start "
                     "fresh — then reload this page.")
             st.stop()
-        H.ensure_baseline()   # so an already-enriched DB has a checkpoint to revert to
+        H.ensure_baseline(st.session_state.db)   # so an already-enriched DB has a checkpoint to revert to
     return st.session_state.db
 
 
@@ -78,9 +78,11 @@ def reload_db():
 
 
 def _undoable(label: str):
-    """Snapshot the DB before an action so it can be undone, and stash the label
-    for the Undo banner. Call right BEFORE the mutation."""
-    H.snapshot_undo()
+    """Snapshot the in-memory DB state before an action so it can be undone, and
+    stash the label for the Undo banner. Call right BEFORE the mutation. The
+    snapshot is an in-RAM copy kept in session_state — cheap (no DB write), and a
+    one-step, this-session undo by design."""
+    st.session_state.undo_state = get_db().snapshot_state()
     st.session_state.undo_label = label
 
 
@@ -102,9 +104,11 @@ def render_undo_banner():
         c1, c2 = st.columns([5, 1])
         c1.info(f"✓ {label}")
         if c2.button("↩ Undo", key="undo_last"):
-            if H.restore_undo():
+            snap = st.session_state.pop("undo_state", None)
+            if snap is not None:
+                get_db().restore_state(snap)   # restores in memory + incremental save
                 st.session_state.pop("undo_label", None)
-                reload_db()
+                refresh_tables()
                 st.toast("Reverted.")
             st.rerun()
 
@@ -1019,7 +1023,7 @@ def render_debug(db):
     if c3.button("↻ Reset all enrichment", key="dbg_enr",
                  help="Send every paper back to Pending (re-runs the cascade)."):
         _run_debug(db, "enrich_all")
-    if c4.button("↩ Undo Review changes", key="dbg_revert", disabled=not H.has_baseline(),
+    if c4.button("↩ Undo Review changes", key="dbg_revert", disabled=not H.has_baseline(db),
                  help="Restore the DB to its state just after the last enrichment — "
                       "undoes all Review-tab edits, deletes, and reclassifications."):
         _run_debug(db, "revert_review")

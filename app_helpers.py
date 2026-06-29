@@ -462,11 +462,10 @@ _DEBUG_BUCKETS = {
 
 def debug_reset(db: Database, action: str) -> str:
     """Run one debug reset and save. Returns a human-readable result line."""
-    # Baseline restore writes the DB file directly and must NOT be followed by
-    # db.save() (which would clobber the restore with the stale in-memory DB) —
-    # the caller reloads from disk afterwards.
+    # revert_to_baseline restores into `db` in place and saves itself, so it
+    # returns before the db.save() at the end of this function.
     if action == "revert_review":
-        if revert_to_baseline():
+        if revert_to_baseline(db):
             return "Restored the post-enrichment state — all Review-tab changes undone."
         return "No baseline yet. Run Enrich once to create the post-enrichment checkpoint."
 
@@ -700,7 +699,7 @@ def enrich_step(db: Database, state: dict, anthropic_key: str | None,
 
     if i >= total:
         db.save()
-        snapshot_baseline()   # checkpoint post-enrich state for "Undo Review changes"
+        snapshot_baseline(db)   # checkpoint post-enrich state for "Undo Review changes"
         return {"done": True, "i": state["done"], "total": total,
                 "counts": dict(state["counts"])}
 
@@ -746,30 +745,25 @@ def run_enrich(db: Database, anthropic_key: str | None,
 # before any Review-tab curation. Restoring it undoes every Review-tab edit,
 # delete, reclassification, and duplicate resolution.
 
-def _baseline_path() -> Path:
-    return config.STATE_DIR / "baseline.db"
+def has_baseline(db: Database) -> bool:
+    return db.has_named_snapshot("baseline")
 
 
-def has_baseline() -> bool:
-    return _baseline_path().exists()
+def snapshot_baseline(db: Database) -> None:
+    """Save the current state as the post-enrichment baseline (a durable snapshot
+    row in the DB, so it works on Turso and survives restarts)."""
+    db.save_named_snapshot("baseline")
 
 
-def snapshot_baseline() -> None:
-    """Save the current DB as the post-enrichment baseline."""
-    src = Path(config.DB_PATH)
-    if src.exists():
-        shutil.copy(src, _baseline_path())
-
-
-def ensure_baseline() -> None:
+def ensure_baseline(db: Database) -> None:
     """Create a baseline from the current DB if none exists yet, so an already-
     enriched DB loaded at startup still has a checkpoint to revert to."""
-    if not has_baseline():
-        snapshot_baseline()
+    if not db.has_named_snapshot("baseline"):
+        db.save_named_snapshot("baseline")
 
 
-def revert_to_baseline() -> bool:
-    """Restore the DB from the post-enrichment baseline, then clear every review
+def revert_to_baseline(db: Database) -> bool:
+    """Restore the post-enrichment baseline into `db`, then clear every review
     acceptance. Returns False if no baseline exists.
 
     Clearing `reviewed` is essential: the baseline is snapshotted at enrich time,
@@ -778,11 +772,8 @@ def revert_to_baseline() -> bool:
     queue (they'd already be marked reviewed). Post-enrichment, nothing is
     reviewed, so dropping all acceptances is the correct "undo review" state.
     """
-    bp = _baseline_path()
-    if not bp.exists():
+    if not db.restore_named_snapshot("baseline"):
         return False
-    shutil.copy(bp, Path(config.DB_PATH))
-    db = Database.load(str(config.DB_PATH), str(config.PROCESSED_FILES_PATH))
     if any(p.get("reviewed") for p in db.all_papers()):
         for p in db.all_papers():
             p["reviewed"] = None
@@ -791,29 +782,11 @@ def revert_to_baseline() -> bool:
 
 
 # ── Single-step undo (per-action, distinct from the post-enrich baseline) ─────
-# Each undoable action copies the DB aside *before* it runs; "Undo" restores it.
-# One level deep (the last action). Note: undoing a DELETE brings the records
-# back, but a deleted paper's PDF was already removed from disk — re-enrich
-# re-fetches it.
-
-def _undo_path() -> Path:
-    return config.STATE_DIR / "undo.db"
-
-
-def snapshot_undo() -> None:
-    """Copy the current DB aside as the pre-action state for a one-step Undo."""
-    src = Path(config.DB_PATH)
-    if src.exists():
-        shutil.copy(src, _undo_path())
-
-
-def restore_undo() -> bool:
-    """Restore the DB from the last pre-action snapshot. False if none exists."""
-    up = _undo_path()
-    if not up.exists():
-        return False
-    shutil.copy(up, Path(config.DB_PATH))
-    return True
+# Handled in app.py: an undoable action stashes db.snapshot_state() (an in-RAM
+# copy) in session_state *before* it runs, and the Undo banner restores it via
+# db.restore_state(). One level deep (the last action), this session only. Note:
+# undoing a DELETE brings the records back, but a deleted paper's local PDF was
+# already removed from disk — re-enrich re-fetches it.
 
 
 # ── PDF export (driven by the DB, not the stale pdfs_to_upload/ cache) ────────
