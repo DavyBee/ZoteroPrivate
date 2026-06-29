@@ -500,10 +500,11 @@ def fetch_llm(url: str, comments: list[Comment],
     else:
         content = prompt
 
+    model = config.llm_model()
     audit = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "url":       url,
-        "model":     config.llm_model(),
+        "model":     model,
         "prompt":    prompt,
         "vision":    pdf_doc is not None,
         "response":  None,
@@ -513,11 +514,21 @@ def fetch_llm(url: str, comments: list[Comment],
 
     try:
         client = anthropic_sdk.Anthropic(api_key=anthropic_key)
-        resp = client.messages.create(
-            model=config.llm_model(),
-            max_tokens=800,
-            messages=[{"role": "user", "content": content}],
-        )
+        messages = [{"role": "user", "content": content}]
+        try:
+            resp = client.messages.create(model=model, max_tokens=800,
+                                           messages=messages)
+        except Exception as e:
+            # Model retired/deprecated (404) → self-heal: switch to a current model
+            # and retry once, so an unmaintained deploy keeps running with no human.
+            new_model = (_auto_heal_model(anthropic_key, model)
+                         if _is_model_unavailable(e) else None)
+            if not new_model:
+                raise
+            audit["model"] = model = new_model
+            audit["model_auto_switched"] = True
+            resp = client.messages.create(model=model, max_tokens=800,
+                                           messages=messages)
         raw_text = resp.content[0].text
         audit["response"] = raw_text
         # Some models (notably Haiku) emit valid JSON followed by explanatory
@@ -540,11 +551,12 @@ def fetch_llm(url: str, comments: list[Comment],
             and len((page_text or "").strip()) < _LOW_CONTEXT_CHARS)
         return fields
     except Exception as e:
-        # A retired/deprecated model surfaces as a 404 here; flag it distinctly
-        # in the audit log so a wave of "API call failed" rows is diagnosable.
-        if getattr(e, "status_code", None) == 404 or type(e).__name__ == "NotFoundError":
-            audit["error"] = (f"model '{config.llm_model()}' unavailable "
-                              f"(deprecated/retired? choose a new one in Settings): {e}")
+        # A 404 reaching here means the configured model was retired AND self-heal
+        # couldn't find a replacement (no models API / offline). Flag it distinctly
+        # so a wave of failures is diagnosable; otherwise it's a generic API error.
+        if _is_model_unavailable(e):
+            audit["error"] = (f"model '{model}' unavailable (deprecated/retired) "
+                              f"and auto-fallback found no replacement: {e}")
         else:
             audit["error"] = f"{type(e).__name__}: {e}"
         return None
@@ -554,6 +566,44 @@ def fetch_llm(url: str, comments: list[Comment],
                 f.write(json.dumps(audit, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+
+def _is_model_unavailable(e: Exception) -> bool:
+    """A retired/deprecated/typo'd model surfaces as a 404 NotFoundError."""
+    return getattr(e, "status_code", None) == 404 or type(e).__name__ == "NotFoundError"
+
+
+def _auto_heal_model(anthropic_key: str, current_model: str) -> Optional[str]:
+    """The configured model was retired (404). Pick the best currently-available
+    replacement from the live Models API and persist it (config.set_llm_model), so
+    an unmaintained deploy keeps working with no human in the loop — and the switch
+    sticks for every later call and across restarts.
+
+    Preference: newest Haiku-tier (matches today's cheap/fast/vision-capable
+    choice), else newest Sonnet, else newest Opus, else the newest Claude model.
+    Returns the chosen id, or None if no replacement could be resolved (no models
+    API, offline) — in which case the caller surfaces the original 404."""
+    try:
+        import anthropic as anthropic_sdk
+        models = anthropic_sdk.Anthropic(api_key=anthropic_key).models.list(
+            limit=1000).data
+    except Exception:
+        return None
+    claude = [m for m in models if str(getattr(m, "id", "")).startswith("claude")]
+    if not claude:
+        return None
+    claude.sort(key=lambda m: str(getattr(m, "created_at", "") or ""), reverse=True)
+    chosen = None
+    for tier in ("haiku", "sonnet", "opus"):
+        chosen = next((m.id for m in claude if tier in m.id and m.id != current_model),
+                      None)
+        if chosen:
+            break
+    chosen = chosen or claude[0].id
+    if chosen == current_model:
+        return None
+    config.set_llm_model(chosen)
+    return chosen
 
 
 def _extract_json_object(text: str) -> str:

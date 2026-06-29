@@ -179,6 +179,50 @@ def llm_model() -> str:
     # covers a missing key, so an empty string would otherwise stick.
     return os.environ.get("LLM_MODEL") or LLM_MODEL_DEFAULT
 
+
+def load_persisted_model() -> None:
+    """Load the model picked in-app (or auto-selected by the retirement self-heal)
+    from the DB into os.environ, so a choice survives restarts on the cloud's
+    ephemeral filesystem with no dashboard or maintainer involved. The DB is the
+    source of truth; os.environ is the per-process cache llm_model() reads.
+
+    Only fills in when LLM_MODEL is empty/unset, so a real shell or .env value
+    still wins for local overrides. Never raises (no DB yet on first run)."""
+    if os.environ.get("LLM_MODEL"):
+        return
+    try:
+        import database
+        model = database.get_setting("LLM_MODEL")
+        if model:
+            os.environ["LLM_MODEL"] = model
+    except Exception:
+        pass
+
+
+def set_llm_model(model: str) -> None:
+    """The one place the active Claude model is changed. Persists to the DB (so it
+    survives restarts AND any lab member can change it in-app without dashboard
+    access — the model is config, not a secret) and updates os.environ for
+    immediate effect this process. Used by the Settings picker and by metadata's
+    automatic fallback when a model is retired. Mirrors to .env locally only."""
+    os.environ["LLM_MODEL"] = model
+    try:
+        import database
+        database.set_setting("LLM_MODEL", model)
+    except Exception:
+        pass
+    if not os.environ.get("TURSO_DATABASE_URL"):   # local dev: keep .env in sync
+        try:
+            update_env({"LLM_MODEL": model})
+        except Exception:
+            pass
+
+
+# Pull the persisted model into os.environ now that .env and Streamlit secrets
+# (incl. the Turso connection) are loaded. After the two loads above, not beside
+# them, because get_setting needs the DB connection details they provide.
+load_persisted_model()
+
 # ── Writing settings back ───────────────────────────────────────────────────
 
 def update_env(updates: dict[str, str]) -> list[str]:

@@ -218,6 +218,16 @@ _SCHEMA_STATEMENTS = (
         messages_processed INTEGER
     )
     """,
+    # Durable key/value app config (currently just LLM_MODEL). Lives in the DB so a
+    # model choice — picked in-app OR auto-selected when a model is retired —
+    # survives restarts on the cloud's ephemeral filesystem, with no dashboard /
+    # maintainer needed. See config.load_persisted_model / config.set_llm_model.
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """,
 )
 
 
@@ -248,6 +258,47 @@ def _ensure_schema(conn) -> None:
     for stmt in _SCHEMA_STATEMENTS:
         conn.execute(stmt)
     conn.commit()
+
+
+# ── Durable key/value settings ────────────────────────────────────────────────
+# Standalone (not on the Database instance) so callers without a loaded Database —
+# config at startup, the LLM self-heal in metadata — can read/write a setting with
+# one call. They open their own connection via _connect, so they hit Turso on the
+# hosted deploy exactly like everything else. The DB path comes from config (late
+# import: database itself does not import config, so there's no cycle).
+
+def _settings_conn():
+    import config
+    return _connect(str(config.DB_PATH))
+
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Read a persisted setting. Never raises — returns `default` if the table,
+    row, or database isn't reachable (e.g. first run, or Turso briefly down)."""
+    try:
+        conn = _settings_conn()
+        try:
+            _ensure_schema(conn)
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            return row[0] if row and row[0] is not None else default
+        finally:
+            conn.close()
+    except Exception:
+        return default
+
+
+def set_setting(key: str, value: str) -> None:
+    """Persist a setting. DELETE+INSERT rather than UPSERT so the local sqlite3
+    and hosted libsql paths behave identically (same reason as save())."""
+    conn = _settings_conn()
+    try:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _paper_row(key: str, p: "Paper") -> tuple:

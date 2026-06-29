@@ -966,8 +966,8 @@ def _model_health():
         help="Pick a current model, or type any model ID the dropdown doesn't list.",
     )
     if st.button("Use this model", disabled=(choice == model)):
-        config.update_env({"LLM_MODEL": choice})
-        _model_status(force=True)
+        config.set_llm_model(choice)   # persists to the DB (survives restarts; no
+        _model_status(force=True)      # dashboard needed) and updates this process
         st.success(f"Model set to `{choice}`.")
         st.rerun()
 
