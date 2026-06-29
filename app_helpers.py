@@ -398,11 +398,12 @@ def make_plain_link(db: Database, url: str) -> None:
 def expand_tweets(db: Database, progress_cb=None) -> dict:
     """For every not-yet-expanded tweet URL, look up the link it shares and add
     that target as a new pending paper (carrying over the tweet's Slack
-    comments). Tweets that resolve (link found or confirmed link-free) are
-    flagged `tweet_expanded` so they aren't fetched again; tweets that ERROR
-    (e.g. X's endpoint is down) are left unflagged so they retry next time.
-    progress_cb(done, total) if given. Returns {scanned, links_found,
-    new_papers, failed}."""
+    comments). Every tweet is flagged `tweet_expanded` afterwards so it isn't
+    fetched again — including ones that ERROR (e.g. X's endpoint is down): we
+    accept the outage and let the tweet stand as a plain link rather than retry,
+    since the tweet itself uploads fine as a bookmark and the (rare) lost target
+    isn't worth re-fetching. progress_cb(done, total) if given. Returns
+    {scanned, links_found, new_papers, failed}."""
     work = [p for p in db.all_papers()
             if is_tweet_url(p.get("url", "")) and not p.get("tweet_expanded")]
     total = len(work)
@@ -411,22 +412,23 @@ def expand_tweets(db: Database, progress_cb=None) -> dict:
         url = p["url"]
         scanned += 1
         status, target = expand_tweet(url)
+        # Mark done no matter what — an X outage doesn't earn a retry anymore; the
+        # tweet just stays a plain link (enrich_paper handles tweet URLs as links).
+        db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=target)
         if status == "error":
-            failed += 1  # leave unflagged → retried when the endpoint is reachable
-        else:
-            db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=target)
-            if status == "ok":
-                links += 1
-                key, is_new = db.add_paper(target)
-                for c in p.get("comments", []) or []:
-                    db.add_comment(key, c)
-                if is_new:
-                    new += 1
-                # The paper the tweet pointed to now has its own record; the tweet
-                # itself is just a pointer, so blank its (paper-derived) metadata
-                # and file it in the Links tab as a plain bookmark. With no
-                # title/DOI it can't collide with the extracted paper in Duplicates.
-                make_plain_link(db, url)
+            failed += 1
+        elif status == "ok":
+            links += 1
+            key, is_new = db.add_paper(target)
+            for c in p.get("comments", []) or []:
+                db.add_comment(key, c)
+            if is_new:
+                new += 1
+            # The paper the tweet pointed to now has its own record; the tweet
+            # itself is just a pointer, so blank its (paper-derived) metadata
+            # and file it in the Links tab as a plain bookmark. With no
+            # title/DOI it can't collide with the extracted paper in Duplicates.
+            make_plain_link(db, url)
         if progress_cb:
             progress_cb(scanned, total)
     db.save()

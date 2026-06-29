@@ -41,11 +41,10 @@ def get_db():
             # A hand-edited / corrupted state file. Show a clear, actionable
             # message and halt rather than crashing with a raw traceback. The
             # file is left untouched, so nothing is lost.
-            st.error("⚠️ The database file couldn't be read.")
+            st.error("The database couldn't be read.")
             st.code(str(exc))
-            st.info("Restore from `state/baseline.db`, open the database in a "
-                    "SQLite tool to repair it, or move the file aside to start "
-                    "fresh — then reload this page.")
+            st.info("Reload the page. If this keeps happening, the data may be "
+                    "corrupted.")
             st.stop()
         H.ensure_baseline(st.session_state.db)   # so an already-enriched DB has a checkpoint to revert to
     return st.session_state.db
@@ -135,9 +134,9 @@ def render_status_bar(db):
     # Enriched breakdown lives *inside* its (widened) column so it stays anchored
     # under that number at any width. Green = ready; yellow = needs action.
     a, b, d = st.columns([1, 2, 1])
-    a.metric("⏳ Pending enrichment", c["Pending"])
-    b.metric("📋 Enriched (not uploaded)", enriched)
-    d.metric("✅ Uploaded", c["Uploaded"])
+    a.metric("Pending enrichment", c["Pending"])
+    b.metric("Enriched (not uploaded)", enriched)
+    d.metric("Uploaded", c["Uploaded"])
     lines = [
         f":green[**{n_ready}** Ready]",
         f":orange[**{n_llm}** LLM] · :orange[**{c['PDF only']}** PDF only]",
@@ -151,7 +150,7 @@ def render_status_bar(db):
 
 def render_env_banner():
     if not config.anthropic_api_key():
-        st.info("No ANTHROPIC_API_KEY set — the LLM fallback stage will be skipped.")
+        st.info("No anthropic key set, so claude cannot be used.")
 
 
 # ── Tab 1: Ingest ───────────────────────────────────────────────────────────
@@ -164,8 +163,7 @@ def tab_ingest(db):
     warn = st.session_state.pop("ingest_warn", None)
     if warn:
         st.warning(warn)
-    st.caption("Drop Slack export `.json` files below and click Ingest, or pick "
-               "from Finder. Already-ingested files are skipped automatically.")
+    st.caption("Upload slack jsons here. Previously uploaded files will be skipped.")
 
     # The uploader's key carries a generation counter; bumping it after an ingest
     # gives a fresh empty uploader, so the files (and the Ingest button) clear
@@ -197,20 +195,20 @@ def tab_ingest(db):
             db, paths,
             progress=lambda f: bar.progress(f, text="Saving to the database…"))
         bar.empty()
-        msg = (f"Added {result['new_papers']} new paper(s) and "
-               f"{result['new_comments']} comment(s) from {result['files']} file(s). "
-               f"{result['skipped']} file(s) already processed.")
+        msg = (f"Added {result['new_papers']} sources and "
+               f"{result['new_comments']} comments from {result['files']} slack jsons. "
+               f"{result['skipped']} files were previously processed from the "
+               "uploaded jsons.")
         if result.get("slack_files"):
-            msg += (f" Found {result['slack_files']} Slack-uploaded file(s) — "
-                    "they'll be downloaded and read when you **Enrich**.")
+            msg += (f" Found {result['slack_files']} uploaded files. They'll be read "
+                    "during enrich.")
         # Desync guard: everything skipped and nothing added. If the DB is also
         # empty, the registry is almost certainly stale — point at the Debug fix.
         if result["skipped"] and not result["new_papers"] and not db.all_papers():
             st.session_state.ingest_warn = (
-                "All files were already in the processed-files registry, but the "
-                "database is empty — the two are out of sync (e.g. after a wipe or "
-                "merge). Open **Debug mode** (bottom of the page) and use "
-                "**“Force re-ingest”** to repopulate.")
+                "The website record shows all jsons were already ingested and "
+                "processed, but the database also seems empty. Try force re-ingesting "
+                "the files in the debug page (at the bottom) to fix this.")
         st.session_state.ingest_result = msg
         st.session_state.uploader_gen = gen + 1   # reset uploader → clears the button
         refresh_tables()   # ingest_paths already mutated the session db + saved
@@ -245,10 +243,8 @@ def _model_deprecated_banner():
     """Red alert when the configured Claude model has been retired. Shown only
     when a key is set (no point if the LLM stage is skipped anyway)."""
     if config.anthropic_api_key() and _model_status() == "unavailable":
-        st.error(f"⚠️ The configured Claude model `{config.llm_model()}` is no "
-                 "longer available — it's been deprecated/retired. The LLM stage "
-                 "will fail until you choose a current model in ⚙ Settings. "
-                 "(Citoid, PDF, and DOI stages are unaffected.)")
+        st.error(f"Model `{config.llm_model()}` is no longer available. The LLM step "
+                 "will fail until you pick a current model in Settings.")
 
 
 def tab_enrich(db):
@@ -270,8 +266,8 @@ def tab_enrich(db):
     n_tw = H.unexpanded_tweet_count(db)
     tw_busy = st.session_state.get("expanding", False)
     if n_tw or tw_busy:
-        st.caption(f"{n_tw} tweet link(s) not yet expanded. Tweets usually point "
-                   "to a paper — expand them to add those URLs as pending papers.")
+        st.caption(f"{n_tw} tweets contain links. Click this to add these links as "
+                   "separate sources.")
         if st.button(f"🐦 Expand {n_tw} tweet link(s)", disabled=tw_busy or not n_tw):
             st.session_state.expanding = True
             st.rerun()
@@ -282,9 +278,7 @@ def tab_enrich(db):
     # ── Enrich ──
     pending = db.unenriched_papers()
     enr_busy = st.session_state.get("enriching", False)
-    st.caption(f"{len(pending)} paper(s) pending. Runs the metadata cascade on "
-               "each (CrossRef → Citoid → PDF/file text → LLM); Slack file "
-               "uploads are downloaded and read here too.")
+    st.caption(f"{len(pending)} waiting to enrich")
     if not pending and not enr_busy:
         st.info("Nothing to enrich.")
         return
@@ -317,11 +311,9 @@ def _enrich_errors_panel(db):
                if p.get("last_error") and H.ui_state(p) in ("Pending", "Upload error")]
     if not errored:
         return
-    with st.expander(f"⚠️ {len(errored)} unresolved paper(s) hit an error on the "
-                     "last enrichment attempt — retry-safe", expanded=False):
-        st.caption("These are kept (not lost) and are still pending. Re-run "
-                   "Enrich after a transient service outage clears; persistent "
-                   "ones need manual handling via the Review tab.")
+    with st.expander(f"{len(errored)} errored on the last enrich", expanded=False):
+        st.caption("There was an error during enrich (maybe the server's "
+                   "connections). Try again.")
         for p in errored[:50]:
             url = p.get("url", "")
             short = url if len(url) <= 80 else url[:77] + "…"
@@ -336,11 +328,31 @@ def _run_expand_ui(db):
         d / max(t, 1), text=f"Checked {d}/{t} tweet(s)…"))
     bar.empty()
     st.session_state.expanding = False
-    warn = (f"{r['failed']} tweet(s) couldn't be read (X's link endpoint may be "
-            "unavailable). Left as links; will retry next time.") if r["failed"] else None
-    st.session_state.tweet_result = (
-        f"Scanned {r['scanned']} tweet(s), found {r['links_found']} link(s), "
-        f"added {r['new_papers']} new paper(s) to enrich.", warn)
+    warn = (f"{r['failed']} tweets couldn't be read (X may be down). Kept as plain "
+            "links.") if r["failed"] else None
+    # Explain how the counts relate, so "found 19 links, added 18 papers" doesn't
+    # look like a glitch: a tweet may share no link, or share one we already have.
+    scanned, found, added = r["scanned"], r["links_found"], r["new_papers"]
+    dupes = found - added                       # links that were already in the library
+    no_link = scanned - r["failed"] - found     # tweets with nothing to add
+    bits = [f"Checked {scanned} tweet(s)."]
+    if found:
+        if added and dupes:
+            were = "was" if dupes == 1 else "were"
+            bits.append(f"{found} pointed to a paper or link — added {added} as new "
+                        f"item(s) to enrich. The other {dupes} {were} duplicate "
+                        "link(s): the same paper was shared by more than one tweet "
+                        "(or was already saved), so it's added only once.")
+        elif added:
+            bits.append(f"Added all {added} linked paper(s)/item(s) to enrich.")
+        else:
+            bits.append(f"All {found} linked item(s) were already in your library — "
+                        "nothing new to add.")
+    else:
+        bits.append("None of them shared a paper or link to add.")
+    if no_link:
+        bits.append(f"({no_link} contained no shareable link.)")
+    st.session_state.tweet_result = (" ".join(bits), warn)
     refresh_tables()   # expand_tweets mutated the session db in place + saved
     st.rerun()
 
@@ -387,8 +399,7 @@ def _run_enrich_step(db):
         st.container(height=300).code("\n".join(reversed(lines)))
 
     if paused:
-        st.info("Paused. Resume to continue, or Stop to end the run "
-                "(progress is saved either way).")
+        st.info("Paused. Resume or stop. Progress is saved either way.")
         return
 
     # Advance one paper, then rerun to do the next.
@@ -573,7 +584,7 @@ def tab_review(db):
     # — Ready (auto-approved + accepted LLM) —
     with sub[0]:
         papers = zotero_client.uploadable_papers(db)
-        st.caption(f"{len(papers)} paper(s) ready to upload ")
+        st.caption(f"{len(papers)} ready to upload to Zotero")
         sel = _review_table(db, papers, "tbl_ready")
         if sel and st.button("🗑 Delete selected", key="del_ready"):
             _undoable(f"Deleted {len(sel)} paper(s)")
@@ -588,8 +599,7 @@ def tab_review(db):
     # — Access issues (needs_manual) —
     with sub[2]:
         papers = H.triage_papers(db)
-        st.caption(f"{len(papers)} paper(s) the pipeline couldn't retrieve "
-                   "metadata for")
+        st.caption(f"{len(papers)} had access issues")
         sel = _curate_tab(db, papers, H.promote_links_to_ready, "tbl_triage",
                           rows=H.triage_rows(papers))
         # The dataframe selection survives the Open click (no reload), so the same
@@ -613,8 +623,7 @@ def tab_review(db):
     # — Links (reachable non-papers worth keeping as webpage bookmarks) —
     with sub[3]:
         papers = H.link_papers(db)
-        st.caption(f"{len(papers)} link(s) the pipeline reached but that aren't "
-                   "directly citable papers")
+        st.caption(f"{len(papers)} links that aren't traditionally citable")
         sel = _curate_tab(db, papers, H.promote_links_to_ready, "tbl_link",
                           rows=H.cull_rows(papers))
         _open_links_row(papers, sel, "tbl_link")
@@ -622,7 +631,7 @@ def tab_review(db):
     # — Likely junk (clutter; bulk-delete) —
     with sub[4]:
         papers = H.junk_papers(db)
-        st.caption(f"{len(papers)} item(s) judged to be clutter")
+        st.caption(f"{len(papers)} seem to be junk")
         sel = _curate_tab(db, papers, H.promote_links_to_ready, "tbl_junk",
                           rows=H.cull_rows(papers))
         _open_links_row(papers, sel, "tbl_junk")
@@ -637,7 +646,7 @@ def _render_duplicates(db):
     if not groups:
         st.success("No duplicate groups detected.")
         return
-    st.caption(f"{len(groups)} group(s) of papers sharing a DOI or title.")
+    st.caption(f"{len(groups)} groups that share a DOI or title")
     # Keys use each paper's stable normalized URL, not a positional index:
     # index keys get reused across groups after a delete and desync the browser.
     for group in groups:
@@ -722,18 +731,16 @@ def tab_upload(db):
             for url, msg in flash_errors:
                 st.text(f"{url}\n    {msg}")
     ready = zotero_client.uploadable_papers(db)
-    st.caption(f"{len(ready)} paper(s) ready for upload (translator / CrossRef, "
-               "plus accepted LLM records, with a title, not yet uploaded).")
+    st.caption(f"{len(ready)} ready to upload to Zotero")
 
     dups = db.find_duplicate_groups()
     if dups:
-        st.warning(f"{len(dups)} duplicate group(s) still present — resolve them "
-                   "in the Review tab first, or upload anyway.")
+        st.warning(f"{len(dups)} duplicates exist. Use the duplicates tab to resolve "
+                   "these or upload anyway with duplicates.")
 
     if st.button("⬆ Upload all ready", type="primary", disabled=not ready):
         _do_upload(ready, db)
-    st.caption("Non-paper links you want to keep are promoted in the **Review** tab "
-               "(select them → Move to Ready); they then upload here with everything else.")
+    st.caption("Move links to Ready to upload without metadata.")
 
     _render_upload_errors(db)
 
@@ -834,11 +841,7 @@ def tab_database(db):
     # Not-uploaded: selectable, with two whole-record actions (no field editing,
     # so nothing here can produce malformed Zotero data).
     with sub[0]:
-        st.caption("Select row(s) to reset them to Pending (re-enrich from "
-                   "scratch) or delete them permanently. These never touch "
-                   "Zotero — uploaded papers are on the next tab and stay "
-                   "view-only (resetting an uploaded paper could re-upload a "
-                   "duplicate).")
+        st.caption("Select rows to re-enrich or delete.")
         if not not_up:
             st.info("No papers here.")
         else:
@@ -877,11 +880,8 @@ def render_footer():
     st.divider()
     st.caption(f"Current Claude model in use: `{config.llm_model()}`")
     if config.anthropic_api_key() and _credit_status() == "no_credit":
-        st.error("⚠️ Anthropic API is out of credits — the LLM stage (web-page "
-                 "fallback **and** Word-doc metadata) will fail until you add "
-                 "credits at console.anthropic.com → Billing. Everything else is "
-                 "unaffected; files still download and fall back to the drag-in "
-                 "folder / Access issues.")
+        st.error("Anthropic API is out of credits. The LLM step fails until you add "
+                 "credits at console.anthropic.com. Everything else works.")
 
 
 # ── Settings ────────────────────────────────────────────────────────────────
