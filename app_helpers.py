@@ -877,7 +877,8 @@ def export_pdfs(db: Database, dest: str | Path, wipe: bool = False) -> int:
 # Mirrors cli.cmd_ingest: hash-dedup against processed_files, parse, add papers
 # + comments, mark files processed. Returns a summary dict for the UI.
 
-def ingest_paths(db: Database, paths: list[str], force: bool = False) -> dict:
+def ingest_paths(db: Database, paths: list[str], force: bool = False,
+                 progress=None) -> dict:
     """Ingest Slack export files. By default a file whose hash is already in the
     processed-files registry is skipped (so curated-away papers aren't resurrected
     on a re-drop). `force=True` ignores that registry and re-parses every file —
@@ -937,6 +938,6 @@ def ingest_paths(db: Database, paths: list[str], force: bool = False) -> dict:
         db.mark_file_processed(name, h, len(file_urls), pf["messages"])
         files_done += 1
 
-    db.save()
+    db.save(progress=progress)   # the network-bound step on Turso; drives the bar
     return {"new_papers": new_papers, "new_comments": new_comments,
             "files": files_done, "skipped": skipped, "slack_files": slack_files}

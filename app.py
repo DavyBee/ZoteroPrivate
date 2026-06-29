@@ -169,8 +169,13 @@ def tab_ingest(db):
         paths.extend(H.finder_pick_files())
 
     if paths:
-        with st.spinner(f"Ingesting {len(paths)} file(s)…"):
-            result = H.ingest_paths(db, paths)
+        bar = st.progress(0.0, text=f"Ingesting {len(paths)} file(s) — parsing…")
+        # Parsing/adding is in-memory and fast; the bar moves during the save,
+        # which on the hosted Turso DB is the only network-bound (slow) step.
+        result = H.ingest_paths(
+            db, paths,
+            progress=lambda f: bar.progress(f, text="Saving to the database…"))
+        bar.empty()
         msg = (f"Added {result['new_papers']} new paper(s) and "
                f"{result['new_comments']} comment(s) from {result['files']} file(s). "
                f"{result['skipped']} file(s) already processed.")

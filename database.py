@@ -323,6 +323,55 @@ def _paper_row(key: str, p: "Paper") -> tuple:
     )
 
 
+def _insert_rows(conn, table: str, columns: tuple, rows: list,
+                 progress=None, replace: bool = False) -> None:
+    """Bulk-insert `rows` with as few network round-trips as possible: one
+    multi-row INSERT per chunk, instead of executemany.
+
+    On a local SQLite file the two are equivalent, but the remote libsql/Turso
+    client issues a round-trip *per row* for executemany — so writing N rows was N
+    network calls to Turso. Batching into multi-row VALUES turns that into
+    ceil(N / chunk) calls. `chunk` keeps the bound-parameter count well under
+    SQLite's limit. `replace=True` emits INSERT OR REPLACE (upsert by primary key),
+    used by the incremental save to update changed rows. `progress`, if given, is
+    called with a 0.0–1.0 fraction after each chunk (drives the ingest bar)."""
+    if not rows:
+        if progress:
+            progress(1.0)
+        return
+    ncols = len(columns)
+    chunk = max(1, 900 // ncols)
+    collist = ", ".join(columns)
+    verb = "INSERT OR REPLACE" if replace else "INSERT"
+    for i in range(0, len(rows), chunk):
+        batch = rows[i:i + chunk]
+        placeholders = ", ".join("(" + ", ".join("?" * ncols) + ")" for _ in batch)
+        flat = [v for row in batch for v in row]
+        conn.execute(f"{verb} INTO {table} ({collist}) VALUES {placeholders}", flat)
+        if progress:
+            progress(min(1.0, (i + len(batch)) / len(rows)))
+
+
+def _delete_keys(conn, table: str, key_col: str, keys: list) -> None:
+    """Delete rows by primary key, batched into chunked `IN (...)` statements so
+    the round-trip count stays bounded on Turso."""
+    if not keys:
+        return
+    chunk = 900
+    for i in range(0, len(keys), chunk):
+        batch = keys[i:i + chunk]
+        placeholders = ", ".join("?" * len(batch))
+        conn.execute(
+            f"DELETE FROM {table} WHERE {key_col} IN ({placeholders})", batch)
+
+
+def _row_sig(record: dict) -> str:
+    """Stable signature of an in-memory record, for detecting which rows changed
+    between saves. sort_keys so a dict whose contents are unchanged always hashes
+    the same regardless of key order."""
+    return json.dumps(record, sort_keys=True, ensure_ascii=False)
+
+
 # ── Database ──────────────────────────────────────────────────────────────────
 
 class Database:
@@ -341,6 +390,15 @@ class Database:
         self.processed_path = processed_path
         self._papers: dict[str, Paper] = {}
         self._processed: dict[str, ProcessedFile] = {}
+        # Snapshot of what's on disk (key -> row signature) as of the last load or
+        # save, so save() can write only the delta instead of rewriting the whole
+        # library every time — the difference between O(library) and O(changed)
+        # network round-trips on Turso. _snapshot_valid stays False until we've
+        # actually read or written disk: a Database built fresh (never loaded)
+        # can't assume the disk is empty, so its first save does a full rewrite.
+        self._papers_saved: dict[str, str] = {}
+        self._processed_saved: dict[str, str] = {}
+        self._snapshot_valid = False
 
     @classmethod
     def load(cls, db_path: str, processed_path: str) -> "Database":
@@ -371,35 +429,80 @@ class Database:
                 }
         finally:
             conn.close()
+        db._adopt_snapshot()   # disk == memory now; baseline future deltas off it
         return db
 
-    def save(self) -> None:
+    _PROCESSED_COLUMNS = ("filename", "hash", "processed_at", "papers_found",
+                          "messages_processed")
+
+    def _adopt_snapshot(self) -> None:
+        """Record the current in-memory state as the on-disk baseline. Called after
+        a successful load or save, so the next save's delta is measured from here."""
+        self._papers_saved = {k: _row_sig(p) for k, p in self._papers.items()}
+        self._processed_saved = {k: _row_sig(r) for k, r in self._processed.items()}
+        self._snapshot_valid = True
+
+    def _processed_row(self, fn: str) -> tuple:
+        r = self._processed[fn]
+        return (fn, r.get("hash"), r.get("processed_at"),
+                r.get("papers_found"), r.get("messages_processed"))
+
+    def save(self, progress=None) -> None:
+        """Persist the in-memory state, writing only the rows that changed since the
+        last load/save (added/modified → upsert, removed → delete) — so cost scales
+        with the size of the change, not the whole library. `progress`, if given, is
+        called with a 0.0–1.0 fraction across the papers upsert (the network-bound
+        step on Turso) to drive a progress bar.
+
+        Change detection diffs each record's signature against the snapshot taken
+        at the last load/save; it relies on every mutation going through the
+        in-memory dicts (nothing writes the DB outside save), which is the class
+        invariant. A Database that was never loaded does one full rewrite first
+        (snapshot unknown), preserving the old disk==memory guarantee."""
+        # Current signatures, computed once. Cheap (local JSON) vs. the network.
+        cur_papers = {k: _row_sig(p) for k, p in self._papers.items()}
+        cur_proc = {k: _row_sig(r) for k, r in self._processed.items()}
+
+        if self._snapshot_valid:
+            paper_dirty = [k for k, s in cur_papers.items()
+                           if self._papers_saved.get(k) != s]
+            paper_deleted = [k for k in self._papers_saved if k not in cur_papers]
+            proc_dirty = [k for k, s in cur_proc.items()
+                          if self._processed_saved.get(k) != s]
+            proc_deleted = [k for k in self._processed_saved if k not in cur_proc]
+            if not (paper_dirty or paper_deleted or proc_dirty or proc_deleted):
+                if progress:
+                    progress(1.0)
+                return   # nothing changed — skip the DB connection entirely
+
         conn = _connect(self.db_path)
         try:
             _ensure_schema(conn)
-            # The whole rewrite runs as one transaction and is committed at the
-            # end, so a crash mid-save leaves the previous contents intact (the
-            # old atomic-replace guarantee). Explicit commit/rollback rather than
-            # `with conn:` so the local sqlite3 and hosted libsql paths behave
-            # identically (libsql doesn't implement the context-manager form).
-            try:
+            if not self._snapshot_valid:
+                # Never loaded — we don't know what's on disk, so rewrite in full to
+                # guarantee disk == memory, then adopt the snapshot below.
                 conn.execute("DELETE FROM papers")
-                conn.executemany(
-                    f"INSERT INTO papers ({', '.join(_PAPER_COLUMNS)}) "
-                    f"VALUES ({', '.join('?' * len(_PAPER_COLUMNS))})",
-                    [_paper_row(k, p) for k, p in self._papers.items()],
-                )
                 conn.execute("DELETE FROM processed_files")
-                conn.executemany(
-                    "INSERT INTO processed_files (filename, hash, processed_at, "
-                    "papers_found, messages_processed) VALUES (?, ?, ?, ?, ?)",
-                    [
-                        (fn, r.get("hash"), r.get("processed_at"),
-                         r.get("papers_found"), r.get("messages_processed"))
-                        for fn, r in self._processed.items()
-                    ],
-                )
+                paper_dirty, paper_deleted = list(self._papers), []
+                proc_dirty, proc_deleted = list(self._processed), []
+
+            # One transaction, committed at the end: a crash mid-save rolls back to
+            # the prior contents. Explicit commit/rollback (not `with conn:`) so the
+            # local sqlite3 and hosted libsql paths behave identically.
+            try:
+                _delete_keys(conn, "papers", "key", paper_deleted)
+                _insert_rows(conn, "papers", _PAPER_COLUMNS,
+                             [_paper_row(k, self._papers[k]) for k in paper_dirty],
+                             progress=progress, replace=True)
+                _delete_keys(conn, "processed_files", "filename", proc_deleted)
+                _insert_rows(conn, "processed_files", self._PROCESSED_COLUMNS,
+                             [self._processed_row(k) for k in proc_dirty],
+                             replace=True)
                 conn.commit()
+                # Commit succeeded → these signatures are now what's on disk.
+                self._papers_saved = cur_papers
+                self._processed_saved = cur_proc
+                self._snapshot_valid = True
             except Exception:
                 try:
                     conn.rollback()
