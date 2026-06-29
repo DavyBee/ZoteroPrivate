@@ -79,6 +79,12 @@ LLM_MODEL_DEFAULT = "claude-haiku-4-5"
 # past a small cap. See metadata._fetch_page_text.
 LLM_PAGE_TEXT_CHARS = 30_000
 
+# When a PDF has no usable text layer (scanned / image-only), the LLM stage falls
+# back to reading the file with Claude's vision. We send only the first N pages —
+# the title/authors/abstract/DOI the cascade needs are always there, and each page
+# costs vision tokens. See metadata.enrich_local_file / fetch_llm(pdf_doc=...).
+LLM_VISION_PAGES = 2
+
 
 # ── .env loading ──────────────────────────────────────────────────────────────
 

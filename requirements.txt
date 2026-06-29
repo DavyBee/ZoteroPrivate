@@ -10,6 +10,7 @@
 curl_cffi>=0.6     # browser-impersonating HTTP client (http_fetch.py); optional — urllib fallback if absent
 pyzotero>=1.5      # Zotero API client (zotero_client.py)
 anthropic>=0.25    # LLM metadata fallback
+pypdf>=4.0         # PDF text extraction for the LLM stage (metadata._extract_pdf_text)
 streamlit>=1.49    # GUI — the primary lab-member interface (app.py)
 watchdog>=6.0
 libsql>=0.1        # hosted SQLite (Turso) client for cloud deploy; only used when

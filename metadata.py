@@ -28,7 +28,6 @@ from __future__ import annotations
 import json
 import re
 import time
-import zlib
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote as url_quote
@@ -63,8 +62,7 @@ def _fetch_page_text(url: str) -> tuple[str, str]:
     Best-effort fetch of a URL's content for the LLM stage. Returns
     `(text, state)`:
       - text  — HTML tags stripped (first config.LLM_PAGE_TEXT_CHARS chars), or
-                PDF text extracted from raw `(...) Tj` operators AND zlib-
-                decompressed FlateDecode streams; "" when there's no extractable
+                PDF text extracted via pypdf; "" when there's no extractable
                 text (e.g. an image).
       - state — one of:
           "ok"      we got a 2xx — we actually saw the page (even if no text
@@ -208,43 +206,54 @@ def _is_pdf_url(url: str) -> bool:
     return path.endswith(".pdf")
 
 
-_PDF_STREAM_RE = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.S)
-_PDF_TJ_RE     = re.compile(rb"\(([^)]*)\)\s*Tj")
-
-
 def _extract_pdf_text(pdf_bytes: bytes) -> str:
     """
-    Pull readable text out of PDF bytes. Looks for `(text) Tj` operators in:
-      - the raw bytes (older / uncompressed PDFs print text directly)
-      - each FlateDecode content stream after zlib decompression (the
-        common case for modern PDFs)
-    Returns everything found, joined with spaces. Best-effort — does not
-    handle every PDF text encoding (Type 3 fonts, CMaps, TJ arrays with
-    kerning) but catches the title, abstract, and DOI of most academic
-    papers, which is all the cascade needs.
+    Pull readable text out of PDF bytes using pypdf, which handles the encodings
+    our old hand-rolled regex didn't — `TJ` arrays with kerning (what LaTeX/
+    pdfTeX emits for nearly all body text), hex strings, and ToUnicode CMaps.
+    That covers the title/abstract/body of essentially all academic PDFs.
+
+    Returns "" when nothing readable comes out — a scanned/image-only PDF, or a
+    file pypdf can't parse — which the cascade reads as "no text" and falls back
+    to the manual drag-in path.
     """
-    chunks: list[str] = []
+    import logging
+    from io import BytesIO
+    from pypdf import PdfReader
 
-    # Tj operators in the raw bytes (older / uncompressed PDFs)
-    for m in _PDF_TJ_RE.finditer(pdf_bytes):
-        try:
-            chunks.append(m.group(1).decode("latin-1"))
-        except Exception:
-            pass
+    # pypdf logs warnings to stderr on malformed/non-PDF input (e.g. a truncated
+    # download or HTML mis-served as a PDF). We already handle those as "no text",
+    # so silence the noise.
+    logging.getLogger("pypdf").setLevel(logging.ERROR)
 
-    # Tj operators inside zlib-decompressed FlateDecode streams (modern PDFs)
-    for s_match in _PDF_STREAM_RE.finditer(pdf_bytes):
-        try:
-            inflated = zlib.decompress(s_match.group(1))
-        except zlib.error:
-            continue
-        for m in _PDF_TJ_RE.finditer(inflated):
-            try:
-                chunks.append(m.group(1).decode("latin-1"))
-            except Exception:
-                pass
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        pages = (page.extract_text() or "" for page in reader.pages)
+        return "\n".join(p for p in pages if p).strip()
+    except Exception:
+        # Encrypted, malformed, or otherwise unreadable — treat as no text.
+        return ""
 
-    return " ".join(chunks)
+
+def _first_pages_pdf(pdf_bytes: bytes, n: int) -> Optional[bytes]:
+    """Return a new PDF containing only the first `n` pages of `pdf_bytes`, for the
+    vision fallback (so Claude reads just the title/abstract pages, not the whole
+    file). Returns None if the PDF can't be parsed/sliced."""
+    import logging
+    from io import BytesIO
+    from pypdf import PdfReader, PdfWriter
+
+    logging.getLogger("pypdf").setLevel(logging.ERROR)
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        writer = PdfWriter()
+        for page in reader.pages[:n]:
+            writer.add_page(page)
+        buf = BytesIO()
+        writer.write(buf)
+        return buf.getvalue()
+    except Exception:
+        return None
 
 
 def _clean_doi(doi: str) -> str:
@@ -386,20 +395,26 @@ _LOW_CONTEXT_CHARS = 500
 
 def fetch_llm(url: str, comments: list[Comment],
               anthropic_key: str, audit_log_path: str,
-              page_text: Optional[str] = None) -> Optional[dict]:
+              page_text: Optional[str] = None,
+              pdf_doc: Optional[bytes] = None) -> Optional[dict]:
     """
     Ask Claude for structured metadata. By default fetches the page itself; pass
     `page_text` to run the LLM on already-extracted content instead (e.g. a local
     .docx's body — see enrich_local_file), in which case the content is "seen" so
-    fetch_state is "ok". Every call — prompt, response, parse, error — is appended
-    to audit_log_path as JSONL for transparency.
+    fetch_state is "ok". Pass `pdf_doc` (raw PDF bytes) instead to have Claude read
+    the file with vision — the fallback for scanned / image-only PDFs with no text
+    layer; the caller pre-slices it to the first pages (config.LLM_VISION_PAGES).
+    Every call — prompt, response, parse, error — is appended to audit_log_path as
+    JSONL for transparency.
     """
     try:
         import anthropic as anthropic_sdk
     except ImportError:
         return None
 
-    if page_text is None:
+    if pdf_doc is not None:
+        fetch_state = "ok"             # Claude sees the file directly via vision
+    elif page_text is None:
         page_text, fetch_state = _fetch_page_text(url)
     else:
         fetch_state = "ok"             # caller supplied the content (a local file)
@@ -463,14 +478,29 @@ def fetch_llm(url: str, comments: list[Comment],
         "\"link\".\n\n"
         f"URL: {url}\n\n"
         f"Slack discussion:\n{slack_context}\n\n"
-        f"Page content:\n{page_text}"
+        + ("The publication is the attached PDF (its first pages)."
+           if pdf_doc is not None else f"Page content:\n{page_text}")
     )
+
+    # Text-only by default; for the vision fallback, prepend the PDF as a document
+    # block so Claude reads the scanned pages directly.
+    if pdf_doc is not None:
+        import base64
+        content = [
+            {"type": "document",
+             "source": {"type": "base64", "media_type": "application/pdf",
+                        "data": base64.standard_b64encode(pdf_doc).decode("ascii")}},
+            {"type": "text", "text": prompt},
+        ]
+    else:
+        content = prompt
 
     audit = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "url":       url,
         "model":     config.llm_model(),
         "prompt":    prompt,
+        "vision":    pdf_doc is not None,
         "response":  None,
         "parsed":    None,
         "error":     None,
@@ -481,7 +511,7 @@ def fetch_llm(url: str, comments: list[Comment],
         resp = client.messages.create(
             model=config.llm_model(),
             max_tokens=800,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": content}],
         )
         raw_text = resp.content[0].text
         audit["response"] = raw_text
@@ -499,7 +529,10 @@ def fetch_llm(url: str, comments: list[Comment],
         # than treating it as an error.
         fields = _llm_to_fields(parsed)
         fields["_fetch_state"] = fetch_state
-        fields["_low_context"] = len((page_text or "").strip()) < _LOW_CONTEXT_CHARS
+        # Vision read the actual pages — not thin context, even though there's no
+        # page_text. Otherwise flag thin text so review can scrutinise it.
+        fields["_low_context"] = (pdf_doc is None
+            and len((page_text or "").strip()) < _LOW_CONTEXT_CHARS)
         return fields
     except Exception as e:
         # A retired/deprecated model surfaces as a 404 here; flag it distinctly
@@ -838,10 +871,29 @@ def enrich_local_file(file_path: str, url: str, comments: list[Comment],
       - title (or useful partial) found → metadata_source "llm" + the metadata
       - otherwise (no key, unreadable/scanned, or nothing extracted) → "pdf_saved",
         falling back to the manual drag-in path (the file is on disk either way).
-    Routing-only hints (category / _fetch_state) are dropped; summary is kept."""
+    Routing-only hints (category / _fetch_state) are dropped; summary is kept.
+
+    A PDF with no usable text layer (scanned / image-only — under
+    _LOW_CONTEXT_CHARS of extracted text) falls back to Claude vision on its first
+    config.LLM_VISION_PAGES pages instead of sending the near-empty text."""
     text = _extract_file_text(file_path)
-    out = (fetch_llm(url, comments, anthropic_key, audit_log_path, page_text=text)
-           if text and anthropic_key else None)
+    out = None
+    if anthropic_key:
+        is_pdf = not file_path.lower().endswith(".docx")
+        if is_pdf and len(text.strip()) < _LOW_CONTEXT_CHARS:
+            try:
+                with open(file_path, "rb") as f:
+                    doc = _first_pages_pdf(f.read(), config.LLM_VISION_PAGES)
+            except OSError:
+                doc = None
+            if doc is not None:
+                out = fetch_llm(url, comments, anthropic_key, audit_log_path,
+                                pdf_doc=doc)
+        # Text path: the normal case, and the fallback if vision was skipped or
+        # the API call failed but we still have some extracted text to try.
+        if out is None and text.strip():
+            out = fetch_llm(url, comments, anthropic_key, audit_log_path,
+                            page_text=text)
     fields: dict = {}
     if out is not None:
         out.pop("category", None)
