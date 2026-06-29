@@ -50,22 +50,13 @@ def get_db():
     return st.session_state.db
 
 
-ADMIN_EMAIL = "david.beeson123@gmail.com"
-
-
 def _is_admin() -> bool:
-    """Debug mode has one-click destructive resets against the SHARED database, so
-    on the hosted deploy it's restricted to the owner. Streamlit fills st.user.email
-    from the Google sign-in on a private Community Cloud app (set by the platform,
-    not spoofable). Local dev has no auth → allow (dev convenience); on the cloud
-    with no verifiable email → deny."""
-    try:
-        email = getattr(st.user, "email", None)
-    except Exception:
-        email = None
-    if email:
-        return email.strip().lower() == ADMIN_EMAIL
-    return not os.environ.get("TURSO_DATABASE_URL")   # local → allow, hosted → deny
+    """Debug mode is restricted to the owner on the hosted deploy.
+    Local dev (no TURSO) → always allow. Cloud → require ADMIN_TOKEN
+    entered via the Settings tab (stored in session state for the session)."""
+    if not os.environ.get("TURSO_DATABASE_URL"):
+        return True   # local dev
+    return st.session_state.get("_admin_unlocked", False)
 
 
 def refresh_tables():
@@ -930,11 +921,20 @@ def tab_settings(db):
         st.info("Secrets are hosted by the Streamlit dashboard. Contact "
                 "david.beeson123@gmail.com (David Beeson) if you need to change "
                 "anything.")
-        try:
-            _detected = getattr(st.user, "email", None) or "(none)"
-        except Exception:
-            _detected = "(error)"
-        st.caption(f"Signed in as: `{_detected}`")
+        _admin_token = os.environ.get("ADMIN_TOKEN", "")
+        if _admin_token:
+            if st.session_state.get("_admin_unlocked"):
+                st.caption("Admin access active for this session.")
+                if st.button("Lock", key="admin_lock"):
+                    st.session_state._admin_unlocked = False
+                    st.rerun()
+            else:
+                _tok = st.text_input("Admin token", type="password",
+                                     key="admin_token_input",
+                                     placeholder="Enter token to unlock debug mode")
+                if _tok and _tok == _admin_token:
+                    st.session_state._admin_unlocked = True
+                    st.rerun()
     else:
         st.caption("Saved to the `.env` file and applied immediately. Leave a field "
                    "blank to keep its current value. Keys are stored in plain text in "
