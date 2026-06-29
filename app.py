@@ -930,6 +930,11 @@ def tab_settings(db):
         st.info("Secrets are hosted by the Streamlit dashboard. Contact "
                 "david.beeson123@gmail.com (David Beeson) if you need to change "
                 "anything.")
+        try:
+            _detected = getattr(st.user, "email", None) or "(none)"
+        except Exception:
+            _detected = "(error)"
+        st.caption(f"Signed in as: `{_detected}`")
     else:
         st.caption("Saved to the `.env` file and applied immediately. Leave a field "
                    "blank to keep its current value. Keys are stored in plain text in "
