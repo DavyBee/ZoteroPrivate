@@ -871,25 +871,36 @@ _SETTINGS_FIELDS = [
 
 def tab_settings(db):
     st.subheader("Settings")
-    st.caption("Saved to the `.env` file and applied immediately. Leave a field "
-               "blank to keep its current value. Keys are stored in plain text in "
-               "`.env` (same as before) — keep that file private.")
-    with st.form("settings_form"):
-        new = {}
-        for env, label, secret in _SETTINGS_FIELDS:
-            current = os.environ.get(env, "")
-            new[env] = st.text_input(label, value=current,
-                                     type="password" if secret else "default",
-                                     help=f"Environment variable: {env}")
-        if st.form_submit_button("💾 Save settings", type="primary"):
-            changed = config.update_env(new)
-            if changed:
-                st.success(f"Saved to {config.PROJECT_ROOT / '.env'} — "
-                           f"updated: {', '.join(changed)}.")
-            else:
-                st.info("No changes written — every field already matched the "
-                        "saved values. (Blank fields are left as-is; to *clear* "
-                        "a value, edit `.env` directly.)")
+    # On the hosted deploy, secrets live in the Streamlit dashboard (bridged into
+    # os.environ by config.load_streamlit_secrets), NOT in .env — which is on the
+    # cloud's ephemeral filesystem and resets on every reboot. So the in-app secrets
+    # form there is both non-persistent and a way to expose the lab's shared keys to
+    # every viewer; hide it and point to the dashboard owner. TURSO_DATABASE_URL is
+    # only set on the hosted deploy (see .env.example), so it's our "is hosted" flag.
+    if os.environ.get("TURSO_DATABASE_URL"):
+        st.info("Secrets are hosted by the Streamlit dashboard. Contact "
+                "david.beeson123@gmail.com (David Beeson) if you need to change "
+                "anything.")
+    else:
+        st.caption("Saved to the `.env` file and applied immediately. Leave a field "
+                   "blank to keep its current value. Keys are stored in plain text in "
+                   "`.env` (same as before) — keep that file private.")
+        with st.form("settings_form"):
+            new = {}
+            for env, label, secret in _SETTINGS_FIELDS:
+                current = os.environ.get(env, "")
+                new[env] = st.text_input(label, value=current,
+                                         type="password" if secret else "default",
+                                         help=f"Environment variable: {env}")
+            if st.form_submit_button("💾 Save settings", type="primary"):
+                changed = config.update_env(new)
+                if changed:
+                    st.success(f"Saved to {config.PROJECT_ROOT / '.env'} — "
+                               f"updated: {', '.join(changed)}.")
+                else:
+                    st.info("No changes written — every field already matched the "
+                            "saved values. (Blank fields are left as-is; to *clear* "
+                            "a value, edit `.env` directly.)")
 
     _backup_section(db)
     _model_health()
