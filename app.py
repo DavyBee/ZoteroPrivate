@@ -51,13 +51,30 @@ def get_db():
     return st.session_state.db
 
 
-def reload_db():
-    st.session_state.db = H.load_db()
-    # Bump the table generation so every dataframe gets a fresh widget key on the
-    # next render. Streamlit keys row-selection state to the widget key; without
-    # this, a stale selection (old row indices) survives a delete/reclassify and
-    # points at the wrong rows — or past the end, crashing with IndexError.
+def refresh_tables():
+    """Give every dataframe a fresh widget key on the next render — WITHOUT
+    re-reading the library from disk.
+
+    Streamlit keys row-selection state to the widget key; without bumping it, a
+    stale selection (old row indices) survives a delete/reclassify and points at
+    the wrong rows — or past the end, crashing with IndexError.
+
+    Use this after an in-memory mutation: the review/upload helpers mutate the
+    session db in place AND call db.save(), so the object is already authoritative
+    and persisted. Re-reading from disk would only duplicate that — and on the
+    hosted Turso DB a reload is a network fetch of every paper, which is what made
+    Review actions slow. reload_db() is for when disk changed *outside* the
+    in-memory object (first load, undo/baseline restore)."""
     st.session_state.table_gen = st.session_state.get("table_gen", 0) + 1
+
+
+def reload_db():
+    """Re-read the canonical DB from disk, then refresh tables. Only needed when
+    the on-disk state diverged from the in-memory object (initial load, or an
+    undo/baseline restore that overwrote the file). After ordinary mutations use
+    refresh_tables() — a full reload over Turso per action is the slow path."""
+    st.session_state.db = H.load_db()
+    refresh_tables()
 
 
 def _undoable(label: str):
@@ -192,7 +209,7 @@ def tab_ingest(db):
                 "**“Force re-ingest”** to repopulate.")
         st.session_state.ingest_result = msg
         st.session_state.uploader_gen = gen + 1   # reset uploader → clears the button
-        reload_db()
+        refresh_tables()   # ingest_paths already mutated the session db + saved
         st.rerun()
 
 
@@ -320,7 +337,7 @@ def _run_expand_ui(db):
     st.session_state.tweet_result = (
         f"Scanned {r['scanned']} tweet(s), found {r['links_found']} link(s), "
         f"added {r['new_papers']} new paper(s) to enrich.", warn)
-    reload_db()
+    refresh_tables()   # expand_tweets mutated the session db in place + saved
     st.rerun()
 
 
@@ -401,7 +418,7 @@ def _finish_enrich(stopped=False):
     st.session_state.enrich_paused = False
     for k in ("enrich_state", "enrich_lines", "enrich_last"):
         st.session_state.pop(k, None)
-    reload_db()
+    refresh_tables()   # enrich mutated the session db in place + saved
 
 
 # ── Tab 3: Review ───────────────────────────────────────────────────────────
@@ -505,12 +522,12 @@ def _curate_tab(db, papers, promote, key, rows=None):
         _undoable(f"Moved all {n} to Ready")
         with st.spinner("Moving to Ready…"):
             promote(db, [p["url"] for p in papers])
-        reload_db(); st.rerun()
+        refresh_tables(); st.rerun()
     if c2.button("☑ Move selected to Ready", key=key + "_sel", disabled=not sel):
         _undoable(f"Moved {len(sel)} to Ready")
         with st.spinner("Moving to Ready…"):
             promote(db, [papers[i]["url"] for i in sel])
-        reload_db(); st.rerun()
+        refresh_tables(); st.rerun()
     if c3.button("🗑 Delete selected", key=key + "_del", disabled=not sel):
         _undoable(f"Deleted {len(sel)} paper(s)")
         _delete_selected(db, papers, sel); st.rerun()
@@ -520,7 +537,7 @@ def _curate_tab(db, papers, promote, key, rows=None):
 def _delete_selected(db, papers, selected_idx):
     urls = [papers[i]["url"] for i in selected_idx if i < len(papers)]
     H.delete_papers(db, urls)               # also removes each paper's PDFs
-    reload_db()
+    refresh_tables()                        # delete_papers mutated the session db + saved
 
 
 def _open_links_row(papers, sel, key):
@@ -585,7 +602,7 @@ def tab_review(db):
                           "them done. They count as Uploaded in the database."):
             _undoable(f"Marked {len(sel)} as added to Zotero")
             n = db.confirm_added_to_zotero([papers[i]["url"] for i in sel])
-            db.save(); reload_db()
+            db.save(); refresh_tables()
             st.toast(f"Marked {n} as added to Zotero.")
             st.rerun()
 
@@ -629,7 +646,7 @@ def _render_duplicates(db):
                     _undoable(f"Resolved duplicate (kept 1, deleted {len(group) - 1})")
                     H.delete_papers(db, [o["url"] for o in group
                                          if o["url"] != p["url"]])  # + their PDFs
-                    reload_db(); st.rerun()
+                    refresh_tables(); st.rerun()
 
 
 # ── Tab 4: Upload ───────────────────────────────────────────────────────────
@@ -655,16 +672,17 @@ def _do_upload(papers, db, as_links=False):
         d / max(t, 1), text=f"Uploaded {d}/{t}…"))
     ubar.empty()
     # upload_papers mutated `db` (the object shared by every tab) in place and
-    # saved to disk. Stash the summary, reload from disk, and RERUN so the whole
-    # page repaints from one consistent state — without the rerun, views rendered
-    # before this point (status bar, Review) show the pre-upload state while the
-    # Database tab (rendered after) shows the post-upload state. See get_db().
+    # saved to disk. Stash the summary and RERUN so the whole page repaints from
+    # one consistent state — without the rerun, views rendered before this point
+    # (status bar, Review) show the pre-upload state while the Database tab
+    # (rendered after) shows the post-upload state. The in-memory db is already
+    # authoritative, so refresh tables rather than re-reading from disk. See get_db().
     st.session_state["upload_flash"] = (
         f"Uploaded {result['uploaded']}/{result['total']}, "
         f"{result['pdfs_attached']} PDF(s) attached, "
         f"{result['notes_added']} Slack note(s) added, {result['failed']} failed.")
     st.session_state["upload_flash_errors"] = result["errors"]
-    reload_db()
+    refresh_tables()
     st.rerun()
 
 
@@ -743,7 +761,7 @@ def tab_upload(db):
             f"Confirmed {n} PDF paper(s) as uploaded"
             + (f"; cleared {cleared} file(s) from the drag-in folder." if cleared
                else "."))
-        reload_db()
+        refresh_tables()
         st.rerun()
 
 
@@ -828,7 +846,7 @@ def tab_database(db):
                                       "Keeps the URL and Slack comments."):
                 _undoable(f"Reset {len(sel)} to Pending")
                 H.reset_papers(db, [not_up[i]["url"] for i in sel])
-                reload_db(); st.rerun()
+                refresh_tables(); st.rerun()
             if sel and c2.button("🗑 Delete permanently", key="db_delete"):
                 _undoable(f"Deleted {len(sel)} paper(s)")
                 _delete_selected(db, not_up, sel); st.rerun()
