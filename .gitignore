@@ -16,7 +16,6 @@ its_lit_copy-DB
 .vscode
 *.md
 !README.md
-!DEPLOY.md
 *.json
 *.jsonl*
 __pycache__

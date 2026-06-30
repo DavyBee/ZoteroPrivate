@@ -692,9 +692,19 @@ def enrich_step(db: Database, state: dict, anthropic_key: str | None,
         skip   → {"skip": True,   ...}                       (gone / already done)
         normal → {"i","total","url","category","label","counts","done":False,...}
 
-    Re-entrancy-safe: the index only advances AFTER a paper is enriched, so an
-    abandoned rerun re-does (never skips) that paper; and an already-enriched
-    paper (an overlapping rerun beat us to it) is skipped without re-counting."""
+    Re-entrancy-safe: we CLAIM a paper (advance the index) before the slow
+    enrich work, not after. enrich_paper makes no st.* calls, so Streamlit's
+    cooperative "stop the old run" can't interrupt it — a rerun fired mid-call
+    lets the first run finish in the background while the second starts. If the
+    index only advanced afterwards, that second run would read the same index,
+    see the paper still unenriched, and enrich it AGAIN: a duplicate LLM call
+    (real cost) and a double count, while both writes land on one DB key so the
+    library still shows one record. Claiming first shrinks the race window to a
+    dict lookup with no I/O, so an overlapping rerun moves on to the next paper.
+    A paper whose run is abandoned after the claim stays metadata_source=="none"
+    and is simply picked up by the NEXT enrich run (enrich_init re-includes every
+    unenriched paper) — deferred, never lost. The metadata_source=="none" guard
+    still skips anything already done without re-counting."""
     urls = state["urls"]
     total = len(urls)
     i = state["idx"]
@@ -706,9 +716,9 @@ def enrich_step(db: Database, state: dict, anthropic_key: str | None,
                 "counts": dict(state["counts"])}
 
     url = urls[i]
+    state["idx"] = i + 1       # claim this paper BEFORE the slow work (see docstring)
     paper = db.get_paper(url)
     if paper is None or paper.get("metadata_source", "none") != "none":
-        state["idx"] = i + 1   # deleted, or already enriched by an overlapping run
         return {"skip": True, "i": state["done"], "total": total, "url": url,
                 "counts": dict(state["counts"]), "done": False, "halted": False}
 
@@ -719,7 +729,6 @@ def enrich_step(db: Database, state: dict, anthropic_key: str | None,
     if fields.get("local_pdf_path"):
         state["counts"]["pdf_total"] += 1
     state["done"] += 1
-    state["idx"] = i + 1       # advance only after a successful enrich
     if state["done"] % 10 == 0:
         db.save()
     return {"i": state["done"], "total": total, "url": url, "category": category,

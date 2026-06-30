@@ -26,6 +26,7 @@ import hashlib
 import copy
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional, TypedDict
@@ -154,6 +155,17 @@ class ProcessedFile(TypedDict):
 
 
 # ── URL normalization & hashing ───────────────────────────────────────────────
+
+# A DOI is `10.<registrant>/<suffix>`. A bare prefix with no suffix (e.g.
+# `10.2139/`) identifies a publisher, not a paper, so it must never key dedup —
+# otherwise distinct works that extracted down to it collide as "duplicates".
+_VALID_DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$")
+
+
+def _is_real_doi(doi: str) -> bool:
+    """True only for a structurally complete DOI (has a non-empty suffix)."""
+    return bool(_VALID_DOI_RE.match((doi or "").strip()))
+
 
 def normalize_url(url: str) -> str:
     """Lowercase scheme + host, strip trailing slash; preserve path case."""
@@ -714,7 +726,7 @@ class Database:
             if is_tweet_url(p.get("url", "")):
                 continue
             doi = (p.get("doi") or "").strip().lower()
-            if doi:
+            if doi and _is_real_doi(doi):
                 by_doi.setdefault(doi, []).append(p)
         for doi, group in by_doi.items():
             if len(group) >= 2:

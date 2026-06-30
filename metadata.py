@@ -256,9 +256,24 @@ def _first_pages_pdf(pdf_bytes: bytes, n: int) -> Optional[bytes]:
         return None
 
 
-def _clean_doi(doi: str) -> str:
-    """Strip trailing punctuation that often gets caught by greedy regex."""
-    return doi.rstrip(".,;:)>]\"'")
+_DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$")
+
+
+def _clean_doi(doi: Optional[str]) -> Optional[str]:
+    """Strip trailing punctuation and validate structure; return a well-formed
+    DOI or None.
+
+    A DOI is `10.<registrant>/<suffix>`. A bare registrant prefix with no
+    suffix — e.g. SSRN's `10.2139/` or OUP's `10.1093/` — is NOT a paper's
+    DOI; it identifies the *publisher*. If we store it as a DOI, every distinct
+    SSRN paper that extracts down to `10.2139/` collides in the Duplicates tab,
+    so three unrelated articles look like one work. DOI syntax is a stable
+    standard (ANSI/NISO Z39.84), so this check won't rot the way a URL-pattern
+    rule would."""
+    if not doi:
+        return None
+    doi = doi.strip().rstrip(".,;:)>]\"'")
+    return doi if _DOI_RE.match(doi) else None
 
 
 def _is_translator_junk(raw: dict) -> bool:
@@ -272,7 +287,7 @@ def _is_translator_junk(raw: dict) -> bool:
     has_author   = bool(raw.get("creators"))
     has_year     = bool(raw.get("date"))
     has_abstract = bool(raw.get("abstractNote"))
-    has_doi      = bool(raw.get("DOI"))
+    has_doi      = bool(_clean_doi(raw.get("DOI")))
     if not (has_author or has_year or has_abstract or has_doi):
         return True
     return False
@@ -302,7 +317,7 @@ def translator_to_fields(raw: dict) -> dict:
         "publisher":  raw.get("publisher"),
         "isbn":       isbn,
         "language":   raw.get("language"),
-        "doi":        raw.get("DOI"),
+        "doi":        _clean_doi(raw.get("DOI")),
     }
 
 
@@ -359,7 +374,7 @@ def crossref_to_fields(data: dict) -> dict:
         "issue":      data.get("issue"),
         "pages":      data.get("page"),
         "publisher":  data.get("publisher"),
-        "doi":        data.get("DOI"),
+        "doi":        _clean_doi(data.get("DOI")),
     }
 
 
@@ -688,7 +703,7 @@ def _llm_to_fields(d: dict) -> dict:
         "volume":       d.get("volume"),
         "issue":        d.get("issue"),
         "pages":        d.get("pages"),
-        "doi":          d.get("doi"),
+        "doi":          _clean_doi(d.get("doi")),
         "summary":      d.get("summary"),
         "category":     (d.get("category") or "paper"),
     }
