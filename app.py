@@ -180,10 +180,21 @@ def tab_ingest(db):
     gen = st.session_state.get("uploader_gen", 0)
     uploaded = st.file_uploader("Slack export JSON files", accept_multiple_files=True,
                                 type="json", key=f"uploader_{gen}")
-    c1, c2 = st.columns(2)
-    go = c1.button(f"📥 Ingest {len(uploaded)} uploaded file(s)" if uploaded
-                   else "📥 Ingest uploaded files", type="primary", disabled=not uploaded)
-    pick = c2.button("📁 Pick from Finder & ingest")
+    # "Pick from Finder" is a native macOS picker (osascript) — meaningless on the
+    # hosted Linux deploy, where uploads come through the file_uploader above. Only
+    # show it when running locally.
+    _is_local = not os.environ.get("TURSO_DATABASE_URL")
+    if _is_local:
+        c1, c2 = st.columns(2)
+        go = c1.button(f"📥 Ingest {len(uploaded)} uploaded file(s)" if uploaded
+                       else "📥 Ingest uploaded files", type="primary",
+                       disabled=not uploaded)
+        pick = c2.button("📁 Pick from Finder & ingest")
+    else:
+        go = st.button(f"📥 Ingest {len(uploaded)} uploaded file(s)" if uploaded
+                       else "📥 Ingest uploaded files", type="primary",
+                       disabled=not uploaded)
+        pick = False
 
     paths: list[str] = []
     if go and uploaded:
@@ -840,9 +851,13 @@ def main():
     with tabs[5]:
         tab_settings(db)
 
-    st.divider()
-    if _is_admin() and st.toggle("🛠 Debug mode", key="debug_mode"):
-        render_debug(db)
+    # The divider + toggle are the seam between the app and the admin-only debug
+    # tools. Render them ONLY for an admin — otherwise a non-admin sees a stray
+    # separator line dangling at the bottom of every page.
+    if _is_admin():
+        st.divider()
+        if st.toggle("🛠 Debug mode", key="debug_mode"):
+            render_debug(db)
 
     render_footer()
 
@@ -924,20 +939,6 @@ def tab_settings(db):
         st.info("Secrets are hosted by the Streamlit dashboard. Contact "
                 "david.beeson123@gmail.com (David Beeson) if you need to change "
                 "anything.")
-        _admin_token = os.environ.get("ADMIN_TOKEN", "")
-        if _admin_token:
-            if st.session_state.get("_admin_unlocked"):
-                st.caption("Admin access active for this session.")
-                if st.button("Lock", key="admin_lock"):
-                    st.session_state._admin_unlocked = False
-                    st.rerun()
-            else:
-                _tok = st.text_input("Admin token", type="password",
-                                     key="admin_token_input",
-                                     placeholder="Enter token to unlock debug mode")
-                if _tok and _tok == _admin_token:
-                    st.session_state._admin_unlocked = True
-                    st.rerun()
     else:
         st.caption("Saved to the `.env` file and applied immediately. Leave a field "
                    "blank to keep its current value. Keys are stored in plain text in "
@@ -961,6 +962,30 @@ def tab_settings(db):
 
     _backup_section(db)
     _model_health()
+    _admin_unlock()
+
+
+def _admin_unlock():
+    """Admin-token gate for debug mode (hosted deploy only). Lives at the very
+    bottom of Settings, out of the way of everyday use. ADMIN_TOKEN is only set
+    on the hosted deploy, so locally this renders nothing (debug is always on)."""
+    _admin_token = os.environ.get("ADMIN_TOKEN", "")
+    if not _admin_token:
+        return
+    st.divider()
+    st.markdown("**Admin**")
+    if st.session_state.get("_admin_unlocked"):
+        st.caption("Admin access active for this session.")
+        if st.button("Lock", key="admin_lock"):
+            st.session_state._admin_unlocked = False
+            st.rerun()
+    else:
+        _tok = st.text_input("Admin token", type="password",
+                             key="admin_token_input",
+                             placeholder="Enter token to unlock debug mode")
+        if _tok and _tok == _admin_token:
+            st.session_state._admin_unlocked = True
+            st.rerun()
 
 
 def _backup_section(db):
@@ -1070,18 +1095,41 @@ def render_debug(db):
                "to repopulate after the database was emptied or got out of sync with "
                "the processed-files registry (e.g. after a merge). Safe: papers and "
                "comments still dedup, so nothing duplicates.")
-    if st.button("📁 Pick files & force re-ingest", key="dbg_reingest"):
-        paths = H.finder_pick_files()
-        if paths:
-            with st.spinner(f"Re-ingesting {len(paths)} file(s)…"):
-                r = H.ingest_paths(db, paths, force=True)
-            slack_note = (f" Found {r['slack_files']} Slack file(s) — they'll be read "
-                          "when you Enrich.") if r.get("slack_files") else ""
-            st.session_state.dbg_result = (
-                f"Force re-ingested: added {r['new_papers']} new paper(s) and "
-                f"{r['new_comments']} comment(s) from {r['files']} file(s)." + slack_note)
-            reload_db()
-            st.rerun()
+    # The Finder picker is macOS-only; on the hosted Linux deploy, take the files
+    # through a file_uploader instead so this recovery tool still works there.
+    _is_local = not os.environ.get("TURSO_DATABASE_URL")
+    if _is_local:
+        if st.button("📁 Pick files & force re-ingest", key="dbg_reingest"):
+            _force_reingest(db, H.finder_pick_files())
+    else:
+        up = st.file_uploader("Slack export JSON files", accept_multiple_files=True,
+                              type="json", key="dbg_reingest_uploader")
+        if st.button("📥 Force re-ingest uploaded file(s)", key="dbg_reingest",
+                     disabled=not up):
+            tmpdir = tempfile.mkdtemp(prefix="slack_reingest_")
+            paths = []
+            for f in up:
+                p = os.path.join(tmpdir, f.name)
+                with open(p, "wb") as out:
+                    out.write(f.getbuffer())
+                paths.append(p)
+            _force_reingest(db, paths)
+
+
+def _force_reingest(db, paths):
+    """Force re-ingest the given Slack JSON paths and report the result. Shared by
+    the local (Finder) and hosted (uploader) debug re-ingest controls."""
+    if not paths:
+        return
+    with st.spinner(f"Re-ingesting {len(paths)} file(s)…"):
+        r = H.ingest_paths(db, paths, force=True)
+    slack_note = (f" Found {r['slack_files']} Slack file(s) — they'll be read "
+                  "when you Enrich.") if r.get("slack_files") else ""
+    st.session_state.dbg_result = (
+        f"Force re-ingested: added {r['new_papers']} new paper(s) and "
+        f"{r['new_comments']} comment(s) from {r['files']} file(s)." + slack_note)
+    reload_db()
+    st.rerun()
 
 
 if __name__ == "__main__":
