@@ -21,7 +21,7 @@ from typing import Callable, Optional
 from pyzotero import zotero
 
 import config
-from database import Database, Paper, normalize_url
+from database import Database, Paper, normalize_url, READY_SOURCES
 
 
 BATCH_SIZE = 50          # Zotero API hard limit per create_items call
@@ -129,7 +129,7 @@ def uploadable_papers(db: Database) -> list[Paper]:
         if p.get("zotero_key") or p.get("upload_error"):
             continue                      # error papers are parked for fixing, not Ready
         src = p.get("metadata_source")
-        if src in ("translator", "crossref_doi"):
+        if src in READY_SOURCES:
             out.append(p)
         elif src == "llm" and p.get("reviewed"):
             out.append(p)

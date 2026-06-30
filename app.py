@@ -15,7 +15,6 @@ that shows the seven user-facing states computed fresh from the live DB.
 from __future__ import annotations
 
 import os
-import subprocess
 import tempfile
 from datetime import datetime
 
@@ -51,11 +50,9 @@ def get_db():
 
 
 def _is_admin() -> bool:
-    """Debug mode is restricted to the owner on the hosted deploy.
-    Local dev (no TURSO) → always allow. Cloud → require ADMIN_TOKEN
-    entered via the Settings tab (stored in session state for the session)."""
-    if not os.environ.get("TURSO_DATABASE_URL"):
-        return True   # local dev
+    """Debug mode is restricted to the owner: it requires the ADMIN_TOKEN
+    (set in the Streamlit dashboard secrets) to be entered via the Settings
+    tab, which unlocks it for the session."""
     return st.session_state.get("_admin_unlocked", False)
 
 
@@ -164,6 +161,19 @@ def render_env_banner():
 
 # ── Tab 1: Ingest ───────────────────────────────────────────────────────────
 
+def _save_uploads_to_tmp(files, prefix: str) -> list[str]:
+    """Write Streamlit UploadedFile objects to a fresh temp dir and return their
+    paths. Shared by the Ingest tab and the debug force-re-ingest control."""
+    tmpdir = tempfile.mkdtemp(prefix=prefix)
+    paths = []
+    for f in files:
+        p = os.path.join(tmpdir, f.name)
+        with open(p, "wb") as out:
+            out.write(f.getbuffer())
+        paths.append(p)
+    return paths
+
+
 def tab_ingest(db):
     st.subheader("Ingest Slack exports")
     flash = st.session_state.pop("ingest_result", None)
@@ -180,32 +190,11 @@ def tab_ingest(db):
     gen = st.session_state.get("uploader_gen", 0)
     uploaded = st.file_uploader("Slack export JSON files", accept_multiple_files=True,
                                 type="json", key=f"uploader_{gen}")
-    # "Pick from Finder" is a native macOS picker (osascript) — meaningless on the
-    # hosted Linux deploy, where uploads come through the file_uploader above. Only
-    # show it when running locally.
-    _is_local = not os.environ.get("TURSO_DATABASE_URL")
-    if _is_local:
-        c1, c2 = st.columns(2)
-        go = c1.button(f"📥 Ingest {len(uploaded)} uploaded file(s)" if uploaded
-                       else "📥 Ingest uploaded files", type="primary",
-                       disabled=not uploaded)
-        pick = c2.button("📁 Pick from Finder & ingest")
-    else:
-        go = st.button(f"📥 Ingest {len(uploaded)} uploaded file(s)" if uploaded
-                       else "📥 Ingest uploaded files", type="primary",
-                       disabled=not uploaded)
-        pick = False
+    go = st.button(f"📥 Ingest {len(uploaded)} uploaded file(s)" if uploaded
+                   else "📥 Ingest uploaded files", type="primary",
+                   disabled=not uploaded)
 
-    paths: list[str] = []
-    if go and uploaded:
-        tmpdir = tempfile.mkdtemp(prefix="slack_ingest_")
-        for f in uploaded:
-            p = os.path.join(tmpdir, f.name)
-            with open(p, "wb") as out:
-                out.write(f.getbuffer())
-            paths.append(p)
-    if pick:
-        paths.extend(H.finder_pick_files())
+    paths = _save_uploads_to_tmp(uploaded, "slack_ingest_") if go and uploaded else []
 
     if paths:
         bar = st.progress(0.0, text=f"Ingesting {len(paths)} file(s) — parsing…")
@@ -771,34 +760,26 @@ def tab_upload(db):
     if n_pdfonly:
         st.divider()
         st.markdown(f"**PDF-only papers ({n_pdfonly})** — saved files with no metadata. "
-                    "Save them to a folder, drag that folder into Zotero desktop (its "
-                    "recognizer fills in the metadata), then click Confirm so they count "
-                    "as uploaded.")
-        n_pdf = len(H.pdf_only_papers(db))
-        _is_local = not os.environ.get("TURSO_DATABASE_URL")
-        c1, c2, c3 = st.columns(3)
-        if _is_local:
-            if c1.button(f"💾 Save {n_pdf} PDFs to a folder…", disabled=not n_pdf):
-                dest = H.finder_pick_folder()
-                if dest:
-                    n = H.export_pdfs(db, dest)
-                    st.success(f"Saved {n} PDF(s) to {dest}")
-            if c2.button(f"📁 Open the default folder ({n_pdf})"):
-                H.export_pdfs(db, H.upload_queue_dir(), wipe=True)
-                subprocess.run(["open", str(H.upload_queue_dir())])
-        else:
-            c1.caption("PDF export to folder requires running the app locally.")
-        if c3.button(f"✓ Confirm {n_pdfonly} added to Zotero",
+                    "Download them, unzip, drag the files into Zotero desktop (its "
+                    "recognizer fills in the metadata), then click Confirm so they "
+                    "count as uploaded.")
+        zip_bytes, n_have = H.zip_pdf_only(db)
+        c1, c2 = st.columns(2)
+        c1.download_button(
+            f"⬇️ Download {n_have} PDF(s) (.zip)", data=zip_bytes,
+            file_name="pdf_only_papers.zip", mime="application/zip",
+            disabled=not n_have)
+        if n_have < n_pdfonly:
+            st.caption(f"{n_pdfonly - n_have} file(s) are no longer on the server — the "
+                       "cloud filesystem resets on restart, so only PDFs saved this "
+                       "session can be downloaded.")
+        if c2.button(f"✓ Confirm {n_pdfonly} added to Zotero",
                      help="Mark the PDF-only papers as done after you've dragged them "
                           "into Zotero desktop, so the counts stay correct."):
             _undoable(f"Confirmed {n_pdfonly} PDF paper(s) as uploaded")
             n = db.confirm_pdf_uploads()
             db.save()
-            cleared = H.clear_upload_queue()    # they've been dragged into Zotero — empty the staging folder
-            st.session_state.upload_flash = (
-                f"Confirmed {n} PDF paper(s) as uploaded"
-                + (f"; cleared {cleared} file(s) from the drag-in folder." if cleared
-                   else "."))
+            st.session_state.upload_flash = f"Confirmed {n} PDF paper(s) as uploaded."
             refresh_tables()
             st.rerun()
 
@@ -917,48 +898,15 @@ def render_footer():
 
 # ── Settings ────────────────────────────────────────────────────────────────
 
-# (env var, label, secret?) for the settings form.
-_SETTINGS_FIELDS = [
-    ("ZOTERO_API_KEY",       "Zotero API key",            True),
-    ("ZOTERO_LIBRARY_ID",    "Zotero library ID",         False),
-    ("ZOTERO_LIBRARY_TYPE",  "Zotero library type (group/user)", False),
-    ("ZOTERO_COLLECTION_KEY", "Zotero collection key (optional)", False),
-    ("ANTHROPIC_API_KEY",    "Anthropic (Claude) API key", True),
-]
-
-
 def tab_settings(db):
     st.subheader("Settings")
-    # On the hosted deploy, secrets live in the Streamlit dashboard (bridged into
-    # os.environ by config.load_streamlit_secrets), NOT in .env — which is on the
-    # cloud's ephemeral filesystem and resets on every reboot. So the in-app secrets
-    # form there is both non-persistent and a way to expose the lab's shared keys to
-    # every viewer; hide it and point to the dashboard owner. TURSO_DATABASE_URL is
-    # only set on the hosted deploy (see .env.example), so it's our "is hosted" flag.
-    if os.environ.get("TURSO_DATABASE_URL"):
-        st.info("Secrets are hosted by the Streamlit dashboard. Contact "
-                "david.beeson123@gmail.com (David Beeson) if you need to change "
-                "anything.")
-    else:
-        st.caption("Saved to the `.env` file and applied immediately. Leave a field "
-                   "blank to keep its current value. Keys are stored in plain text in "
-                   "`.env` (same as before) — keep that file private.")
-        with st.form("settings_form"):
-            new = {}
-            for env, label, secret in _SETTINGS_FIELDS:
-                current = os.environ.get(env, "")
-                new[env] = st.text_input(label, value=current,
-                                         type="password" if secret else "default",
-                                         help=f"Environment variable: {env}")
-            if st.form_submit_button("💾 Save settings", type="primary"):
-                changed = config.update_env(new)
-                if changed:
-                    st.success(f"Saved to {config.PROJECT_ROOT / '.env'} — "
-                               f"updated: {', '.join(changed)}.")
-                else:
-                    st.info("No changes written — every field already matched the "
-                            "saved values. (Blank fields are left as-is; to *clear* "
-                            "a value, edit `.env` directly.)")
+    # Secrets live in the Streamlit dashboard (bridged into os.environ by
+    # config.load_streamlit_secrets), never in-app: the cloud filesystem is
+    # ephemeral, and an in-app form would expose the lab's shared keys to every
+    # viewer. Changes go through the dashboard owner.
+    st.info("Secrets are hosted by the Streamlit dashboard. Contact "
+            "david.beeson123@gmail.com (David Beeson) if you need to change "
+            "anything.")
 
     _backup_section(db)
     _model_health()
@@ -966,9 +914,9 @@ def tab_settings(db):
 
 
 def _admin_unlock():
-    """Admin-token gate for debug mode (hosted deploy only). Lives at the very
-    bottom of Settings, out of the way of everyday use. ADMIN_TOKEN is only set
-    on the hosted deploy, so locally this renders nothing (debug is always on)."""
+    """Admin-token gate for debug mode. Lives at the very bottom of Settings, out
+    of the way of everyday use. Renders nothing unless ADMIN_TOKEN is configured
+    in the dashboard secrets; entering it unlocks debug mode for the session."""
     _admin_token = os.environ.get("ADMIN_TOKEN", "")
     if not _admin_token:
         return
@@ -1095,25 +1043,11 @@ def render_debug(db):
                "to repopulate after the database was emptied or got out of sync with "
                "the processed-files registry (e.g. after a merge). Safe: papers and "
                "comments still dedup, so nothing duplicates.")
-    # The Finder picker is macOS-only; on the hosted Linux deploy, take the files
-    # through a file_uploader instead so this recovery tool still works there.
-    _is_local = not os.environ.get("TURSO_DATABASE_URL")
-    if _is_local:
-        if st.button("📁 Pick files & force re-ingest", key="dbg_reingest"):
-            _force_reingest(db, H.finder_pick_files())
-    else:
-        up = st.file_uploader("Slack export JSON files", accept_multiple_files=True,
-                              type="json", key="dbg_reingest_uploader")
-        if st.button("📥 Force re-ingest uploaded file(s)", key="dbg_reingest",
-                     disabled=not up):
-            tmpdir = tempfile.mkdtemp(prefix="slack_reingest_")
-            paths = []
-            for f in up:
-                p = os.path.join(tmpdir, f.name)
-                with open(p, "wb") as out:
-                    out.write(f.getbuffer())
-                paths.append(p)
-            _force_reingest(db, paths)
+    up = st.file_uploader("Slack export JSON files", accept_multiple_files=True,
+                          type="json", key="dbg_reingest_uploader")
+    if st.button("📥 Force re-ingest uploaded file(s)", key="dbg_reingest",
+                 disabled=not up):
+        _force_reingest(db, _save_uploads_to_tmp(up, "slack_reingest_"))
 
 
 def _force_reingest(db, paths):

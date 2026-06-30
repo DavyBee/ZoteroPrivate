@@ -201,11 +201,6 @@ def lookup_doi(doi: str) -> Optional[tuple[str, dict]]:
     return None
 
 
-def _is_pdf_url(url: str) -> bool:
-    path = url.lower().split("?", 1)[0].split("#", 1)[0]
-    return path.endswith(".pdf")
-
-
 def _extract_pdf_text(pdf_bytes: bytes) -> str:
     """
     Pull readable text out of PDF bytes using pypdf, which handles the encodings

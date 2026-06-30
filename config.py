@@ -204,57 +204,16 @@ def set_llm_model(model: str) -> None:
     survives restarts AND any lab member can change it in-app without dashboard
     access — the model is config, not a secret) and updates os.environ for
     immediate effect this process. Used by the Settings picker and by metadata's
-    automatic fallback when a model is retired. Mirrors to .env locally only."""
+    automatic fallback when a model is retired."""
     os.environ["LLM_MODEL"] = model
     try:
         import database
         database.set_setting("LLM_MODEL", model)
     except Exception:
         pass
-    if not os.environ.get("TURSO_DATABASE_URL"):   # local dev: keep .env in sync
-        try:
-            update_env({"LLM_MODEL": model})
-        except Exception:
-            pass
 
 
 # Pull the persisted model into os.environ now that .env and Streamlit secrets
 # (incl. the Turso connection) are loaded. After the two loads above, not beside
 # them, because get_setting needs the DB connection details they provide.
 load_persisted_model()
-
-# ── Writing settings back ───────────────────────────────────────────────────
-
-def update_env(updates: dict[str, str]) -> list[str]:
-    """Apply settings to the running process (os.environ) AND persist them to
-    the .env file. Existing .env lines/comments are preserved; changed keys are
-    rewritten in place, new keys appended. Blank values are skipped (use a key's
-    existing value rather than clearing it). Called by the Settings page.
-
-    Returns the list of keys whose value actually changed (so the UI can report
-    exactly what was written, instead of always claiming success).
-    """
-    updates = {k: v for k, v in updates.items() if v is not None and v != ""}
-    if not updates:
-        return []
-    changed = sorted(k for k, v in updates.items() if os.environ.get(k) != v)
-    for k, v in updates.items():
-        os.environ[k] = v   # override (unlike load_dotenv's setdefault)
-
-    path = PROJECT_ROOT / ".env"
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    out, seen = [], set()
-    for line in lines:
-        s = line.strip()
-        if s and not s.startswith("#") and "=" in s:
-            key = s.split("=", 1)[0].strip()
-            if key in updates:
-                out.append(f"{key}={updates[key]}")
-                seen.add(key)
-                continue
-        out.append(line)
-    for k, v in updates.items():
-        if k not in seen:
-            out.append(f"{k}={v}")
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
-    return changed

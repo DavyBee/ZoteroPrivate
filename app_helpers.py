@@ -17,14 +17,12 @@ Responsibilities:
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
-import time
 from pathlib import Path
 from typing import Iterator, Optional
 
 import config
-from database import Database, hash_file, normalize_url
+from database import (Database, hash_file, normalize_url,
+                      READY_SOURCES, CITABLE_SOURCES)
 from slack_parser import parse_files
 from metadata import enrich_paper, fetch_webpage_metadata
 from url_expander import is_tweet_url, expand_tweet
@@ -50,9 +48,8 @@ _SOURCE_TO_STATE = {
     "non_paper":    "Likely junk",
 }
 
-# translator/crossref are auto-approved. LLM records must be human-reviewed
-# before they count as Ready (see llm_review_queue / zotero_client.uploadable_papers).
-READY_SOURCES = ("translator", "crossref_doi")
+# READY_SOURCES / CITABLE_SOURCES are imported from database (the single source
+# of truth for the metadata-source taxonomy).
 
 
 def ui_state(paper: dict) -> str:
@@ -459,7 +456,7 @@ DEBUG_ACTIONS = {
 }
 
 _DEBUG_BUCKETS = {
-    "ready":   {"translator", "crossref_doi"},
+    "ready":   set(READY_SOURCES),
     "pdf":     {"pdf_saved"},
     "llm":     {"llm"},
     "triage":  {"needs_manual"},
@@ -503,27 +500,6 @@ def debug_reset(db: Database, action: str) -> str:
         return "Unknown action."
     db.save()
     return msg
-
-
-# ── Native macOS file/folder pickers (osascript) ──────────────────────────────
-
-def finder_pick_files() -> list[str]:
-    """Native multi-file picker for Slack JSON exports. [] on cancel/error."""
-    script = (
-        'set fs to choose file with prompt "Select Slack export JSON files" '
-        'of type {"json"} with multiple selections allowed\n'
-        'set out to ""\n'
-        'repeat with f in fs\n  set out to out & POSIX path of f & "\n"\nend repeat\n'
-        'return out'
-    )
-    return [line for line in _osascript(script).splitlines() if line.strip()]
-
-
-def finder_pick_folder() -> Optional[str]:
-    """Native folder picker for the PDF export. None on cancel/error."""
-    script = ('set d to choose folder with prompt '
-              '"Choose a folder to save the PDFs into"\nreturn POSIX path of d')
-    return _osascript(script).strip() or None
 
 
 def open_urls(urls: list[str]) -> int:
@@ -616,15 +592,6 @@ def available_models(api_key: Optional[str]) -> list[str]:
     return claude or ids
 
 
-def _osascript(script: str) -> str:
-    try:
-        res = subprocess.run(["osascript", "-e", script],
-                             capture_output=True, text=True, timeout=300)
-        return res.stdout
-    except Exception:
-        return ""
-
-
 # ── Enrich-loop runner ──────────────────────────────────────────────────────
 
 def _outcome(fields: dict) -> tuple[str, str]:
@@ -648,9 +615,9 @@ def _outcome(fields: dict) -> tuple[str, str]:
         return "manual", "⚑ access issues"
     if src in READY_SOURCES and title:
         return "ok", f"✓ {src}{pdf}: {title[:60]}"
-    if src in ("translator", "crossref_doi", "llm") and title:
+    if src in CITABLE_SOURCES and title:
         return "llm", f"✓ {src}{pdf}: {title[:60]}"
-    if src in ("translator", "crossref_doi", "llm"):
+    if src in CITABLE_SOURCES:
         bits = []
         for f in ("doi", "year", "journal"):
             if fields.get(f):
@@ -806,30 +773,11 @@ def revert_to_baseline(db: Database) -> bool:
 # PDF-only papers (unconfirmed pdf_saved, with a PDF on disk) so counts match
 # the "PDF only" status metric.
 
-def upload_queue_dir() -> Path:
-    return config.PROJECT_ROOT / "pdfs_to_upload"
-
-
-def clear_upload_queue() -> int:
-    """Empty the pdfs_to_upload/ drag-in folder (PDF files only; the folder
-    stays). Called after the lab member confirms they've dragged the folder into
-    Zotero desktop, so the staging area doesn't keep showing already-imported
-    PDFs. The canonical pdfs/ store is left untouched — enrich re-stages a copy
-    here if a new pdf_saved paper appears. Returns the count removed."""
-    queue = upload_queue_dir()
-    if not queue.exists():
-        return 0
-    n = 0
-    for f in queue.iterdir():
-        if f.suffix.lower() == ".pdf":
-            f.unlink()
-            n += 1
-    return n
-
-
 def pdf_only_papers(db: Database) -> list[dict]:
     """Papers still needing manual PDF import: pdf_saved, not yet confirmed, with
-    their PDF present on disk."""
+    their PDF present on disk. On the cloud the filesystem is ephemeral, so a
+    paper counted under "PDF only" can have a path whose file no longer exists —
+    those are excluded here (only downloadable files are returned)."""
     out = []
     for p in db.all_papers():
         if p.get("metadata_source") == "pdf_saved" and not p.get("pdf_confirmed"):
@@ -839,22 +787,27 @@ def pdf_only_papers(db: Database) -> list[dict]:
     return out
 
 
-def export_pdfs(db: Database, dest: str | Path, wipe: bool = False) -> int:
-    """Copy the current PDF-only papers' PDFs into `dest`. If wipe, clear any
-    existing PDFs in `dest` first (used to rebuild the default queue folder so
-    it can't go stale). Returns the count copied."""
-    dest = Path(dest)
-    if wipe and dest.exists():
-        for f in dest.iterdir():
-            if f.suffix.lower() == ".pdf":
-                f.unlink()
-    dest.mkdir(parents=True, exist_ok=True)
+def zip_pdf_only(db: Database) -> tuple[bytes, int]:
+    """Build an in-memory zip of every downloadable PDF-only paper's file, for the
+    lab member to download and drag into Zotero desktop. Returns (zip_bytes,
+    count). Empty zip (count 0) when none of the files are present this session —
+    the expected case after a cloud restart wipes the ephemeral filesystem."""
+    import io
+    import zipfile
+    buf = io.BytesIO()
     n = 0
-    for p in pdf_only_papers(db):
-        src = Path(p["local_pdf_path"])
-        shutil.copy2(src, dest / src.name)
-        n += 1
-    return n
+    used: set[str] = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in pdf_only_papers(db):
+            src = Path(p["local_pdf_path"])
+            arc, i = src.name, 1
+            while arc in used:        # avoid clobbering same-named PDFs in the zip
+                arc = f"{src.stem}_{i}{src.suffix}"
+                i += 1
+            used.add(arc)
+            zf.write(src, arc)
+            n += 1
+    return buf.getvalue(), n
 
 
 # ── Ingest orchestration ────────────────────────────────────────────────────

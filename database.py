@@ -154,6 +154,21 @@ class ProcessedFile(TypedDict):
     messages_processed: int
 
 
+# ── Metadata-source taxonomy ──────────────────────────────────────────────────
+# A paper's `metadata_source` records which pipeline stage resolved it. These
+# constants are the single source of truth for what each source means — every
+# other module imports them instead of re-listing the strings, so the rules
+# can't quietly drift apart between the UI, the uploader, and the stats.
+
+# Citation-grade results from Zotero's own engine: auto-approved for upload.
+READY_SOURCES = ("translator", "crossref_doi")
+
+# Sources that carry (or aim for) real bibliographic metadata. "llm" is included
+# but is deliberately NOT in READY_SOURCES: LLM results need human review before
+# they can be uploaded (see zotero_client.uploadable_papers).
+CITABLE_SOURCES = ("translator", "crossref_doi", "llm")
+
+
 # ── URL normalization & hashing ───────────────────────────────────────────────
 
 # A DOI is `10.<registrant>/<suffix>`. A bare prefix with no suffix (e.g.
@@ -901,8 +916,7 @@ class Database:
             "total":             len(papers),
             "pdfs_saved":        sum(1 for p in papers if src(p) == "pdf_saved"),
             "pdf_disk_mb":       round(pdf_bytes / (1024 * 1024), 1),
-            "with_metadata":     sum(1 for p in papers if src(p) in
-                                     ("translator", "crossref_doi", "llm")),
+            "with_metadata":     sum(1 for p in papers if src(p) in CITABLE_SOURCES),
             "needs_manual":      sum(1 for p in papers if src(p) == "needs_manual"),
             "links":             sum(1 for p in papers if src(p) == "link"),
             "non_papers":        sum(1 for p in papers if src(p) == "non_paper"),
