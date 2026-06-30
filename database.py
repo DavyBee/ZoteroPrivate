@@ -744,12 +744,12 @@ class Database:
 
     def delete_paper(self, url: str) -> bool:
         """Remove a paper from the DB by URL, along with its downloaded PDF
-        (canonical store + upload-queue copy). Returns True if it existed."""
+        (canonical store + upload-queue copy). Does NOT save — caller must call
+        save() after one or more deletions. Returns True if it existed."""
         key = normalize_url(url)
         if key in self._papers:
             pdf_storage.delete_local_pdfs(self._papers[key].get("local_pdf_path"))
             del self._papers[key]
-            self.save()
             return True
         return False
 

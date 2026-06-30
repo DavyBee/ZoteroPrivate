@@ -337,17 +337,19 @@ def _run_expand_ui(db):
         d / max(t, 1), text=f"Checked {d}/{t} tweet(s)…"))
     bar.empty()
     st.session_state.expanding = False
-    warn = (f"{r['failed']} tweets couldn't be read (X may be down). Kept as plain "
-            "links.") if r["failed"] else None
-    # Explain how the counts relate, so "found 19 links, added 18 papers" doesn't
-    # look like a glitch: a tweet may share no link, or share one we already have.
     scanned, found, added = r["scanned"], r["links_found"], r["new_papers"]
-    dupes = found - added                       # links that were already in the library
-    no_link = scanned - r["failed"] - found     # tweets with nothing to add
+    gone, failed = r["gone"], r["failed"]
+    dupes = found - added
+    no_link = scanned - found - gone - failed   # readable but no external link
+    warn_parts = []
+    if gone:
+        warn_parts.append(f"{gone} deleted or protected — moved to Likely junk.")
+    if failed:
+        warn_parts.append(f"{failed} couldn't be read (X may be down) — moved to Likely junk.")
+    warn = " ".join(warn_parts) or None
     bits = [f"Checked {scanned} tweet(s)."]
     if found:
         if added and dupes:
-            were = "was" if dupes == 1 else "were"
             bits.append(f"{found} pointed to a paper or link, adding {added} new "
                         f"item(s) to enrich.")
         elif added:
@@ -551,7 +553,7 @@ def _curate_tab(db, papers, promote, key, rows=None):
             promote(db, [papers[i]["url"] for i in sel])
         refresh_tables(); st.rerun()
     if c3.button("🗑 Delete selected", key=key + "_del", disabled=not sel):
-        _undoable(f"Deleted {len(sel)} paper(s)")
+        _undoable(f"Deleted {len(sel)} sources")
         _delete_selected(db, papers, sel); st.rerun()
     return sel
 
@@ -594,7 +596,7 @@ def tab_review(db):
         st.caption(f"{len(papers)} ready to upload to Zotero")
         sel = _review_table(db, papers, "tbl_ready")
         if sel and st.button("🗑 Delete selected", key="del_ready"):
-            _undoable(f"Deleted {len(sel)} paper(s)")
+            _undoable(f"Deleted {len(sel)} source(s)")
             _delete_selected(db, papers, sel)
             st.rerun()
 

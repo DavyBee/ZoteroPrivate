@@ -208,11 +208,13 @@ def cull_rows(papers: list[dict]) -> list[dict]:
 
 def delete_papers(db: Database, urls: list[str]) -> int:
     """Delete papers AND their downloaded PDFs (canonical store + upload queue).
-    db.delete_paper removes the PDF and saves on each call. Returns the count."""
+    All deletions happen in memory first, then one save at the end. Returns count."""
     n = 0
     for url in urls:
-        if db.delete_paper(url):     # delete_paper removes PDFs + saves internally
+        if db.delete_paper(url):
             n += 1
+    if n:
+        db.save()
     return n
 
 
@@ -398,42 +400,45 @@ def make_plain_link(db: Database, url: str) -> None:
 def expand_tweets(db: Database, progress_cb=None) -> dict:
     """For every not-yet-expanded tweet URL, look up the link it shares and add
     that target as a new pending paper (carrying over the tweet's Slack
-    comments). Every tweet is flagged `tweet_expanded` afterwards so it isn't
-    fetched again — including ones that ERROR (e.g. X's endpoint is down): we
-    accept the outage and let the tweet stand as a plain link rather than retry,
-    since the tweet itself uploads fine as a bookmark and the (rare) lost target
-    isn't worth re-fetching. progress_cb(done, total) if given. Returns
-    {scanned, links_found, new_papers, failed}."""
+    comments). progress_cb(done, total) if given.
+    Returns {scanned, links_found, new_papers, gone, failed}."""
     work = [p for p in db.all_papers()
             if is_tweet_url(p.get("url", "")) and not p.get("tweet_expanded")]
     total = len(work)
-    scanned = links = new = failed = 0
+    scanned = links = new = gone = failed = 0
     for p in work:
         url = p["url"]
         scanned += 1
         status, target = expand_tweet(url)
-        # Mark done no matter what — an X outage doesn't earn a retry anymore; the
-        # tweet just stays a plain link (enrich_paper handles tweet URLs as links).
-        db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=target)
-        if status == "error":
-            failed += 1
-        elif status == "ok":
+        if status == "ok":
             links += 1
             key, is_new = db.add_paper(target)
             for c in p.get("comments", []) or []:
                 db.add_comment(key, c)
             if is_new:
                 new += 1
-            # The paper the tweet pointed to now has its own record; the tweet
-            # itself is just a pointer, so blank its (paper-derived) metadata
-            # and file it in the Links tab as a plain bookmark. With no
-            # title/DOI it can't collide with the extracted paper in Duplicates.
             make_plain_link(db, url)
+            db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=target)
+        elif status == "gone":
+            # Permanently deleted or protected — confirmed dead, goes to Junk.
+            gone += 1
+            db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=None,
+                            metadata_source="non_paper", item_type="webpage")
+        elif status == "empty":
+            # Tweet was readable but shares no external link — not citable.
+            db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=None,
+                            metadata_source="non_paper", item_type="webpage")
+        else:
+            # Transient error (X down, network failure) — still mark expanded so
+            # we don't retry endlessly; goes to Junk. Can be reset via debug if needed.
+            failed += 1
+            db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=None,
+                            metadata_source="non_paper", item_type="webpage")
         if progress_cb:
             progress_cb(scanned, total)
     db.save()
     return {"scanned": scanned, "links_found": links,
-            "new_papers": new, "failed": failed}
+            "new_papers": new, "gone": gone, "failed": failed}
 
 
 # ── Debug-mode pipeline resets ────────────────────────────────────────────────

@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Optional
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -48,19 +49,19 @@ def is_tweet_url(url: str) -> bool:
 def expand_tweet(url: str) -> tuple[str, Optional[str]]:
     """Resolve the link a tweet shares. Returns (status, target_url):
 
-        "ok"    — found an external link; target_url is set
-        "empty" — the tweet was read fine but shares no external link
-        "error" — the tweet couldn't be read (not a tweet, endpoint down,
-                  deleted/protected tweet, network failure)
+        "ok"      — found an external link; target_url is set
+        "empty"   — tweet was read fine but shares no external link
+        "gone"    — tweet is permanently deleted/protected (HTTP 404/403/410)
+        "error"   — transient failure (X down, network error, timeout)
 
-    The caller must treat "error" differently from "empty": an "error" should
-    NOT be marked as processed, so it retries once the endpoint is reachable
-    again. Never raises.
+    Never raises.
     """
     m = _TWEET_RE.match((url or "").strip())
     if not m:
-        return ("error", None)
-    data = _fetch_syndication(m.group(1))
+        return ("gone", None)
+    data, gone = _fetch_syndication(m.group(1))
+    if gone:
+        return ("gone", None)
     if data is None:
         return ("error", None)
     for entry in (data.get("entities") or {}).get("urls") or []:
@@ -72,7 +73,10 @@ def expand_tweet(url: str) -> tuple[str, Optional[str]]:
 
 # ── internals ─────────────────────────────────────────────────────────────────
 
-def _fetch_syndication(tweet_id: str) -> Optional[dict]:
+def _fetch_syndication(tweet_id: str) -> tuple[Optional[dict], bool]:
+    """Returns (data, gone). gone=True means the tweet is permanently
+    deleted/protected (HTTP 4xx that won't change); data=None with gone=False
+    means a transient failure (X down, network error, timeout)."""
     url = _SYNDICATION.format(id=tweet_id, token=_token(tweet_id))
     req = Request(url, headers={
         "User-Agent": config.BROWSER_USER_AGENT,
@@ -80,9 +84,13 @@ def _fetch_syndication(tweet_id: str) -> Optional[dict]:
     })
     try:
         with urlopen(req, timeout=config.HTTP_TIMEOUT) as resp:
-            return json.loads(resp.read(500_000).decode("utf-8", errors="replace"))
+            return json.loads(resp.read(500_000).decode("utf-8", errors="replace")), False
+    except HTTPError as e:
+        if e.code in (403, 404, 410):
+            return None, True   # deleted or protected — permanent
+        return None, False      # other HTTP error — possibly transient
     except Exception:
-        return None
+        return None, False      # network/timeout — transient
 
 
 def _token(tweet_id: str) -> str:
