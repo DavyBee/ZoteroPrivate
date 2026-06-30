@@ -350,17 +350,17 @@ def _run_expand_ui(db):
     bits = [f"Checked {scanned} tweet(s)."]
     if found:
         if added and dupes:
-            bits.append(f"{found} pointed to a paper or link, adding {added} new "
-                        f"item(s) to enrich.")
+            bits.append(f"{found} contained a link; added {added} to enrich "
+                        f"({dupes} skipped — same link shared by multiple tweets).")
         elif added:
-            bits.append(f"Added all {added} linked paper(s)/item(s) to enrich.")
+            bits.append(f"{found} contained a link; added {added} to enrich.")
         else:
-            bits.append(f"All {found} linked item(s) were already in your library — "
-                        "nothing new to add.")
+            bits.append(f"{found} contained a link, but all pointed to the same URL — "
+                        f"1 item added.")
     else:
-        bits.append("None of them shared a paper or link to add.")
+        bits.append("None contained a shareable link.")
     if no_link:
-        bits.append(f"({no_link} contained no shareable link.)")
+        bits.append(f"({no_link} were text-only or media with no external link.)")
     st.session_state.tweet_result = (" ".join(bits), warn)
     refresh_tables()   # expand_tweets mutated the session db in place + saved
     st.rerun()
