@@ -275,7 +275,7 @@ def tab_enrich(db):
     n_tw = H.unexpanded_tweet_count(db)
     tw_busy = st.session_state.get("expanding", False)
     if n_tw or tw_busy:
-        st.caption(f"{n_tw} tweets contain links. Click this to add these links as "
+        st.caption(f"{n_tw} tweets may contain links. Click this to attempt to add these links as "
                    "separate sources.")
         if st.button(f"🐦 Expand {n_tw} tweet link(s)", disabled=tw_busy or not n_tw):
             st.session_state.expanding = True
@@ -348,10 +348,8 @@ def _run_expand_ui(db):
     if found:
         if added and dupes:
             were = "was" if dupes == 1 else "were"
-            bits.append(f"{found} pointed to a paper or link — added {added} as new "
-                        f"item(s) to enrich. The other {dupes} {were} duplicate "
-                        "link(s): the same paper was shared by more than one tweet "
-                        "(or was already saved), so it's added only once.")
+            bits.append(f"{found} pointed to a paper or link, adding {added} new "
+                        f"item(s) to enrich.")
         elif added:
             bits.append(f"Added all {added} linked paper(s)/item(s) to enrich.")
         else:
@@ -764,16 +762,19 @@ def tab_upload(db):
                     "recognizer fills in the metadata), then click Confirm so they count "
                     "as uploaded.")
         n_pdf = len(H.pdf_only_papers(db))
+        _is_local = not os.environ.get("TURSO_DATABASE_URL")
         c1, c2, c3 = st.columns(3)
-        if c1.button(f"💾 Save {n_pdf} PDFs to a folder…", disabled=not n_pdf):
-            dest = H.finder_pick_folder()
-            if dest:
-                n = H.export_pdfs(db, dest)
-                st.success(f"Saved {n} PDF(s) to {dest}")
-        if c2.button(f"📁 Open the default folder ({n_pdf})"):
-            # Rebuild the default queue from the DB first so it can't show stale files.
-            H.export_pdfs(db, H.upload_queue_dir(), wipe=True)
-            subprocess.run(["open", str(H.upload_queue_dir())])
+        if _is_local:
+            if c1.button(f"💾 Save {n_pdf} PDFs to a folder…", disabled=not n_pdf):
+                dest = H.finder_pick_folder()
+                if dest:
+                    n = H.export_pdfs(db, dest)
+                    st.success(f"Saved {n} PDF(s) to {dest}")
+            if c2.button(f"📁 Open the default folder ({n_pdf})"):
+                H.export_pdfs(db, H.upload_queue_dir(), wipe=True)
+                subprocess.run(["open", str(H.upload_queue_dir())])
+        else:
+            c1.caption("PDF export to folder requires running the app locally.")
         if c3.button(f"✓ Confirm {n_pdfonly} added to Zotero",
                      help="Mark the PDF-only papers as done after you've dragged them "
                           "into Zotero desktop, so the counts stay correct."):

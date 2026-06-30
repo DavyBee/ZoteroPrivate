@@ -521,27 +521,21 @@ def finder_pick_folder() -> Optional[str]:
 
 
 def open_urls(urls: list[str]) -> int:
-    """Open each URL as a new tab in the running default browser (macOS `open`),
-    de-duped, blanks dropped. We deliberately use the *default* browser (not a
-    hardcoded one): that's where the lab member's Zotero connector is installed.
-    Used by the Access-issues / Links / Likely-junk tabs so the connector can be
-    run on every page in one go — or so they can eyeball which are simply down (a
-    Cloudflare challenge, a paywall, and a dead 404 look different to a human even
-    though the fetcher can't reliably tell them apart). Returns count opened.
-
-    We do NOT pass `open -n`: that launches a NEW browser instance, which Chrome/
-    Safari answer by restoring the current session's tabs into the new window and
-    then appending ours — the lab saw their existing tabs get duplicated. Plain
-    `open` reuses the running browser and adds the links as tabs, which is the
-    expected behaviour. (A genuine fresh window isn't reachably reliable across
-    arbitrary default browsers without hardcoding one, so tabs it is.)"""
+    """Open each URL as a new browser tab via JavaScript window.open(), de-duped,
+    blanks dropped. Works on both local and hosted (cloud) deployments — the JS
+    runs in the user's browser, not on the server. Browsers may block popups if
+    many tabs are opened at once; the user may need to allow them once. Returns
+    count opened."""
+    import json
+    import streamlit.components.v1 as components
     seen: list[str] = []
     for u in urls:
         if u and u not in seen:
             seen.append(u)
     if not seen:
         return 0
-    subprocess.run(["open", *seen])
+    js = "".join(f"window.open({json.dumps(u)}, '_blank');" for u in seen)
+    components.html(f"<script>{js}</script>", height=0)
     return len(seen)
 
 
