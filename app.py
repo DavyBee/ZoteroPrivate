@@ -345,7 +345,7 @@ def _run_expand_ui(db):
     if gone:
         warn_parts.append(f"{gone} deleted or protected — moved to Likely junk.")
     if failed:
-        warn_parts.append(f"{failed} couldn't be read (X may be down) — moved to Likely junk.")
+        warn_parts.append(f"{failed} couldn't be read (X may be down) — kept as links.")
     warn = " ".join(warn_parts) or None
     bits = [f"Checked {scanned} tweet(s)."]
     if found:

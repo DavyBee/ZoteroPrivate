@@ -208,13 +208,11 @@ def cull_rows(papers: list[dict]) -> list[dict]:
 
 def delete_papers(db: Database, urls: list[str]) -> int:
     """Delete papers AND their downloaded PDFs (canonical store + upload queue).
-    All deletions happen in memory first, then one save at the end. Returns count."""
+    db.delete_paper removes the PDF and saves on each call. Returns the count."""
     n = 0
     for url in urls:
-        if db.delete_paper(url):
+        if db.delete_paper(url):     # delete_paper removes PDFs + saves internally
             n += 1
-    if n:
-        db.save()
     return n
 
 
@@ -425,16 +423,15 @@ def expand_tweets(db: Database, progress_cb=None) -> dict:
             db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=None,
                             metadata_source="non_paper", item_type="webpage")
         elif status == "empty":
-            # Tweet was readable but shares no external link — keep as a plain
-            # link bookmark (it's a real tweet, just text/media only).
-            make_plain_link(db, url)
-            db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=None)
+            # Tweet was readable but shares no external link — not citable.
+            db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=None,
+                            metadata_source="non_paper", item_type="webpage")
         else:
-            # Transient error (X down, network failure) — keep as a plain link;
-            # the tweet likely exists, we just couldn't read it right now.
+            # Transient error (X down, network failure) — still mark expanded so
+            # we don't retry endlessly; goes to Junk. Can be reset via debug if needed.
             failed += 1
-            make_plain_link(db, url)
-            db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=None)
+            db.update_paper(normalize_url(url), tweet_expanded=True, tweet_target=None,
+                            metadata_source="non_paper", item_type="webpage")
         if progress_cb:
             progress_cb(scanned, total)
     db.save()
