@@ -147,6 +147,44 @@ def test_uploadable_does_not_itself_check_title(db):
     assert "https://d.example/no-title" in urls
 
 
+# ── Tweet expansion (network stubbed) ────────────────────────────────────────────
+
+def _stub_tweet(monkeypatch, syndication, page_gone):
+    import url_expander
+    monkeypatch.setattr(url_expander, "_fetch_syndication", lambda tid: syndication)
+    monkeypatch.setattr(url_expander, "_fetch_page_gone", lambda url: page_gone)
+    return url_expander.expand_tweet("https://x.com/u/status/1")
+
+
+def test_deleted_tweet_tombstone_is_gone(monkeypatch):
+    # X returns HTTP 200 + a TweetTombstone body for deleted tweets (only
+    # never-existed ids 404), so the tombstone must map to "gone", not "empty" —
+    # otherwise dead tweets are kept as Links instead of going to Junk.
+    # Either marker alone must be enough (robust to partial format changes).
+    for body in ({"__typename": "TweetTombstone"}, {"tombstone": {"text": "x"}}):
+        assert _stub_tweet(monkeypatch, (body, False), True) == ("gone", None)
+        # …even when the page itself can't be reached for a second opinion.
+        assert _stub_tweet(monkeypatch, (body, False), None) == ("gone", None)
+
+
+def test_page_status_is_the_liveness_authority(monkeypatch):
+    # If X someday changes the syndication format entirely, dead-or-alive is
+    # still decided by the tweet page's own HTTP status (format-independent).
+    unrecognized = ({"some_future_field": 1}, False)
+    assert _stub_tweet(monkeypatch, unrecognized, True) == ("gone", None)
+    assert _stub_tweet(monkeypatch, unrecognized, False) == ("empty", None)
+    # Can't reach the page either → degrade to Links (visible), never Junk.
+    assert _stub_tweet(monkeypatch, unrecognized, None) == ("empty", None)
+
+
+def test_live_tweet_never_junked_when_syndication_dies(monkeypatch):
+    # Even if the syndication endpoint is retired and 404s every request, a
+    # tweet whose page still loads must stay visible as a Link, not be junked.
+    assert _stub_tweet(monkeypatch, (None, True), False) == ("empty", None)
+    # And a transient syndication failure stays a transient error.
+    assert _stub_tweet(monkeypatch, (None, False), None) == ("error", None)
+
+
 # ── Enrich loop orchestration (network stubbed) ─────────────────────────────────
 
 def test_run_enrich_drives_every_pending_paper_once(db, monkeypatch):

@@ -50,24 +50,43 @@ def expand_tweet(url: str) -> tuple[str, Optional[str]]:
     """Resolve the link a tweet shares. Returns (status, target_url):
 
         "ok"      — found an external link; target_url is set
-        "empty"   — tweet was read fine but shares no external link
-        "gone"    — tweet is permanently deleted/protected (HTTP 404/403/410)
+        "empty"   — tweet is alive but shares no external link
+        "gone"    — tweet is permanently deleted/protected
         "error"   — transient failure (X down, network error, timeout)
+
+    Dead-or-alive is decided by the tweet page's own HTTP status wherever
+    possible (x.com answers 200 for live tweets and 404 for deleted ones, even
+    logged out) — a signal independent of any X data format, so it keeps
+    working if the syndication response changes shape or disappears. The
+    syndication endpoint is used to *extract the link*; its dead/alive verdict
+    (a 4xx, or an HTTP-200 "tombstone" body, which is how deleted tweets
+    actually come back) only breaks ties when the page can't be reached.
 
     Never raises.
     """
     m = _TWEET_RE.match((url or "").strip())
     if not m:
         return ("gone", None)
-    data, gone = _fetch_syndication(m.group(1))
-    if gone:
+    data, syndication_gone = _fetch_syndication(m.group(1))
+    tombstoned = bool(data) and (
+        data.get("__typename") == "TweetTombstone" or "tombstone" in data)
+    if data is not None and not tombstoned:
+        for entry in (data.get("entities") or {}).get("urls") or []:
+            target = entry.get("expanded_url") or entry.get("url")
+            if target and target.startswith("http") and not _is_twitter_host(target):
+                return ("ok", target)
+    # No link recovered — the tweet is dead, unreadable, or genuinely link-less.
+    # Ask the page itself which it is (see docstring).
+    page_gone = _fetch_page_gone(url)
+    if page_gone is True:
         return ("gone", None)
+    if syndication_gone or tombstoned:
+        # Syndication says dead. If the page demonstrably loads the tweet does
+        # exist (age-restricted tweets tombstone, for example) — keep it
+        # visible as a link bookmark; otherwise trust the syndication verdict.
+        return ("empty", None) if page_gone is False else ("gone", None)
     if data is None:
         return ("error", None)
-    for entry in (data.get("entities") or {}).get("urls") or []:
-        target = entry.get("expanded_url") or entry.get("url")
-        if target and target.startswith("http") and not _is_twitter_host(target):
-            return ("ok", target)
     return ("empty", None)
 
 
@@ -91,6 +110,22 @@ def _fetch_syndication(tweet_id: str) -> tuple[Optional[dict], bool]:
         return None, False      # other HTTP error — possibly transient
     except Exception:
         return None, False      # network/timeout — transient
+
+
+def _fetch_page_gone(url: str) -> Optional[bool]:
+    """Dead-or-alive straight from the tweet's own x.com page, judged ONLY by
+    the HTTP status: 200 = alive (False), 404/410 = deleted (True), anything
+    else = can't tell (None). The response body is deliberately ignored, so
+    this survives any markup/JSON redesign on X's side."""
+    req = Request((url or "").strip(),
+                  headers={"User-Agent": config.BROWSER_USER_AGENT})
+    try:
+        with urlopen(req, timeout=config.HTTP_TIMEOUT):
+            return False
+    except HTTPError as e:
+        return True if e.code in (404, 410) else None
+    except Exception:
+        return None
 
 
 def _token(tweet_id: str) -> str:
